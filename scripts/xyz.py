@@ -612,48 +612,121 @@ def cmd_token(args):
             print("Token 无效或已过期")
 
 
-def cmd_search(args):
-    """Search podcasts via iTunes Search API (no auth needed)."""
-    query = args.query
-    limit = args.limit or 10
+def _search_itunes(query, limit):
+    """Search podcasts via iTunes Search API. No auth needed.
 
+    Returns list of result dicts. Returns empty list on failure (never raises).
+    """
     url = f"https://itunes.apple.com/search?term={quote(query)}&media=podcast&country=CN&limit={limit}"
-
-    print(f"正在搜索: {query}...")
     try:
         resp = requests.get(url, timeout=15)
-    except requests.exceptions.RequestException as e:
-        print(f"网络错误: {e}")
-        sys.exit(1)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        results = data.get("results", [])
+        out = []
+        for r in results:
+            item = {
+                "title": r.get("collectionName", "Unknown"),
+                "author": r.get("artistName", ""),
+                "source": "itunes",
+            }
+            page_url = r.get("collectionViewUrl", "")
+            feed_url = r.get("feedUrl", "")
+            if page_url:
+                item["page_url"] = page_url
+            if feed_url:
+                item["feed_url"] = feed_url
+            out.append(item)
+        return out
+    except Exception:
+        return []
 
-    if resp.status_code != 200:
-        print(f"搜索失败 [{resp.status_code}]")
-        sys.exit(1)
 
-    data = resp.json()
-    results = data.get("results", [])
+def _search_xiaoyuzhou(query, limit, config):
+    """Search podcasts via Xiaoyuzhou native API. Requires authentication.
 
-    if not results:
+    Returns list of result dicts with pid, title, author, etc.
+    Raises APIError on failure.
+    """
+    result = api_request("POST", "/v1/search/create", config,
+                         json={"keyword": query, "type": "PODCAST"})
+    data = result.get("data", [])
+    if not isinstance(data, list):
+        data = data.get("data", []) if isinstance(data, dict) else []
+    out = []
+    for item in data[:limit]:
+        out.append({
+            "pid": item.get("pid", ""),
+            "title": item.get("title", "Unknown"),
+            "author": item.get("author", ""),
+            "description": item.get("brief") or item.get("description", ""),
+            "episode_count": item.get("episodeCount", 0),
+            "subscription_count": item.get("subscriptionCount", 0),
+            "source": "xiaoyuzhou",
+        })
+    return out
+
+
+def cmd_search(args):
+    """Search podcasts via iTunes API with Xiaoyuzhou API fallback."""
+    query = args.query
+    limit = args.limit or 10
+    force_xyz = getattr(args, "xiaoyuzhou", False)
+
+    # Step 1: iTunes (unless --xiaoyuzhou flag)
+    if not force_xyz:
+        print(f"正在搜索 (iTunes): {query}...")
+        itunes_results = _search_itunes(query, limit)
+
+        if itunes_results:
+            print(f"\n找到 {len(itunes_results)} 个结果 (iTunes):\n")
+            for i, r in enumerate(itunes_results, 1):
+                print(f"  {i}. {r['title']}")
+                print(f"     作者: {r['author']}")
+                if r.get("page_url"):
+                    print(f"     页面: {r['page_url']}")
+                if r.get("feed_url"):
+                    print(f"     RSS:  {r['feed_url']}")
+                print()
+            print("提示: 如果没找到目标播客，可使用 -x 参数搜索小宇宙独占播客")
+            print("  例如: python xyz.py search {0} -x".format(query))
+            return
+    else:
+        print(f"正在搜索 (小宇宙): {query}...")
+
+    # Step 2: Fallback to Xiaoyuzhou native API
+    if not force_xyz:
+        print("iTunes 未找到结果，尝试小宇宙搜索...")
+
+    config = load_config()
+    if not config.get("access_token") and not config.get("refresh_token"):
+        print("未找到相关播客")
+        print("提示: 小宇宙搜索需要登录。运行 python xyz.py login 后可搜索小宇宙独占播客")
+        return
+
+    try:
+        xyz_results = _search_xiaoyuzhou(query, limit, config)
+    except APIError as e:
+        print(f"小宇宙搜索失败: {e}")
         print("未找到相关播客")
         return
 
-    print(f"\n找到 {len(results)} 个结果:\n")
-    for i, r in enumerate(results, 1):
-        name = r.get("collectionName", "Unknown")
-        artist = r.get("artistName", "")
-        feed_url = r.get("feedUrl", "")
-        page_url = r.get("collectionViewUrl", "")
+    if not xyz_results:
+        print("未找到相关播客")
+        return
 
-        print(f"  {i}. {name}")
-        print(f"     作者: {artist}")
-        if page_url:
-            print(f"     页面: {page_url}")
-        if feed_url:
-            print(f"     RSS:  {feed_url}")
+    print(f"\n找到 {len(xyz_results)} 个结果 (小宇宙):\n")
+    for i, r in enumerate(xyz_results, 1):
+        print(f"  {i}. {r['title']}")
+        print(f"     作者: {r['author']}")
+        print(f"     播客ID: {r['pid']}")
+        if r.get("episode_count"):
+            print(f"     节数: {r['episode_count']}")
+        if r.get("description"):
+            desc = r["description"][:80]
+            print(f"     简介: {desc}")
         print()
-
-    print("提示: 小宇宙播客 ID 可从页面 URL 中获取")
-    print("  例如 https://www.xiaoyuzhoufm.com/podcast/XXXXX 中的 XXXXX 就是播客 ID")
 
 
 def cmd_podcast(args):
@@ -741,7 +814,7 @@ def cmd_episodes(args):
         pub_date = ep.get("pubDate", "")
         private = ep.get("isPrivateMedia", False)
 
-        duration_min = duration // 1000 // 60 if isinstance(duration, (int, float)) else 0
+        duration_min = duration // 60 if isinstance(duration, (int, float)) else 0
         private_tag = " [付费]" if private else ""
 
         print(f"  {eid}  {title}{private_tag}")
@@ -768,7 +841,7 @@ def cmd_episode(args):
     title = episode.get("title", "Untitled")
     description = episode.get("description", "")
     duration = episode.get("duration", 0)
-    duration_min = duration // 1000 // 60 if isinstance(duration, (int, float)) else 0
+    duration_min = duration // 60 if isinstance(duration, (int, float)) else 0
     private = episode.get("isPrivateMedia", False)
     subtitle_count = episode.get("subtitleCount", 0)
 
@@ -1104,8 +1177,15 @@ def _cleanup_wav(audio_path):
         wav_path.unlink()
 
 
-def transcribe_audio(audio_path, model_size="small"):
-    """Transcribe audio file using faster-whisper. Returns full text."""
+def transcribe_audio(audio_path, model_size="base", timeout=0):
+    """Transcribe audio file using faster-whisper. Returns full text.
+
+    Args:
+        audio_path: Path to audio file
+        model_size: Whisper model size (tiny/base/small/medium/large-v3)
+        timeout: Max seconds for transcription (0 = no limit). Returns empty string on timeout.
+                 Uses a subprocess to enforce the timeout — the whisper process is killed on timeout.
+    """
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -1118,28 +1198,66 @@ def transcribe_audio(audio_path, model_size="small"):
 
     wav_path = _convert_for_whisper(audio_path)
 
+    if timeout and timeout > 0:
+        # Subprocess approach: runs whisper in a separate process that can be truly killed
+        import subprocess, json
+        script = (
+            "import sys,json,os;"
+            f"os.environ.setdefault('HF_ENDPOINT','https://hf-mirror.com');"
+            f"os.environ.setdefault('KMP_DUPLICATE_LIB_OK','TRUE');"
+            "from faster_whisper import WhisperModel;"
+            f"model=WhisperModel('{model_size}',device='cpu',compute_type='int8');"
+            f"segs,info=model.transcribe(r'{wav_path}',language='zh',beam_size=3,"
+            "vad_filter=True,vad_parameters=dict(min_silence_duration_ms=500));"
+            "print(''.join(s.text.strip() for s in segs))"
+        )
+        print(f"    正在转录 (超时 {timeout}s)...")
+        t0 = time.time()
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                capture_output=True, text=True, timeout=timeout,
+                encoding="utf-8", errors="replace",
+            )
+            if proc.returncode != 0:
+                print(f"    转录进程失败: {proc.stderr[:200]}")
+                _cleanup_wav(audio_path)
+                return ""
+            full_text = proc.stdout.strip()
+            elapsed = time.time() - t0
+            print(f"    转录完成: {len(full_text)} 字, 耗时 {elapsed:.0f}s")
+            _cleanup_wav(audio_path)
+            return full_text
+        except subprocess.TimeoutExpired:
+            print(f"    转录超时 (超过 {timeout}秒)")
+            _cleanup_wav(audio_path)
+            return ""
+
+    # No timeout — run in-process (faster, no subprocess overhead)
     print(f"    加载 Whisper 模型 ({model_size})...")
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
     print("    正在转录...")
     t0 = time.time()
-    segments, info = model.transcribe(
-        str(wav_path),
-        language="zh",
-        beam_size=3,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
-    )
+    try:
+        segments, info = model.transcribe(
+            str(wav_path),
+            language="zh",
+            beam_size=3,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=500),
+        )
+        text_parts = [seg.text.strip() for seg in segments]
+        full_text = "".join(text_parts)
+        elapsed = time.time() - t0
+        audio_min = info.duration / 60
+        print(f"    转录完成: {len(full_text)} 字, 音频 {audio_min:.1f} 分钟, 耗时 {elapsed:.0f}s")
+    except Exception as e:
+        print(f"    转录失败: {e}")
+        _cleanup_wav(audio_path)
+        return ""
 
-    text_parts = [seg.text.strip() for seg in segments]
-    elapsed = time.time() - t0
-    full_text = "".join(text_parts)
-    audio_min = info.duration / 60
-    print(f"    转录完成: {len(full_text)} 字, 音频 {audio_min:.1f} 分钟, 耗时 {elapsed:.0f}s")
-
-    # Clean up temp WAV
     _cleanup_wav(audio_path)
-
     return full_text
 
 
@@ -1147,11 +1265,25 @@ def transcribe_audio(audio_path, model_size="small"):
 # Crawl Command
 # ============================================================
 
-def _process_single_episode(eid, seq, output_dir, audio_dir, config, whisper_model="small"):
+def _process_single_episode(eid, seq, output_dir, audio_dir, config, whisper_model="base",
+                            no_transcribe=False, transcribe_timeout=0):
     """Process a single episode: get details, subtitle or transcribe, save .md.
 
     Returns the saved file path on success, None on failure.
+    Skips if a .md file containing this eid already exists in output_dir.
+    If no subtitle and audio exists, saves metadata first, then transcribes.
     """
+    # Check if already processed (resume support)
+    eid_marker = f"**单集ID**: {eid}"
+    for md_file in output_dir.glob("*.md"):
+        try:
+            content = md_file.read_text(encoding="utf-8", errors="ignore")
+            if eid_marker in content:
+                print(f"\n  [{seq}] {eid} — 已存在，跳过 ({md_file.name})")
+                return md_file
+        except OSError:
+            pass
+
     print(f"\n  [{seq}] {eid}")
 
     try:
@@ -1203,12 +1335,23 @@ def _process_single_episode(eid, seq, output_dir, audio_dir, config, whisper_mod
                                 duration, shownotes, "内置字幕", subtitle_text, ep_meta)
         return md_file
 
-    # No subtitles — download and transcribe
+    # No subtitles
     if not audio_url:
         print(f"    {pub_date} {title} — 无音频无字幕，跳过")
         return None
 
-    print(f"    {pub_date} {title} — 下载音频...")
+    # Save metadata-first placeholder (ensures .md exists even if transcription fails)
+    placeholder_text = "[\u5f85转录: 音频已下载但尚未转录，请稍后重试或使用 --no-transcribe 跳过]"
+    md_file = _save_episode(output_dir, seq, pub_date, eid, title, desc,
+                            duration, shownotes, "音频转录", placeholder_text, ep_meta)
+    print(f"    {pub_date} {title} — 先保存元信息")
+
+    if no_transcribe:
+        print(f"    已跳过转录 (--no-transcribe)")
+        return md_file
+
+    # Download audio
+    print(f"    下载音频...")
     audio_file = audio_dir / f"{eid}.m4a"
     if not audio_file.exists():
         session = create_session()
@@ -1222,9 +1365,14 @@ def _process_single_episode(eid, seq, output_dir, audio_dir, config, whisper_mod
         mb = audio_file.stat().st_size / 1024 / 1024
         print(f"    音频已存在 ({mb:.1f}MB)")
 
-    transcript = transcribe_audio(audio_file, whisper_model)
-    md_file = _save_episode(output_dir, seq, pub_date, eid, title, desc,
-                            duration, shownotes, "音频转录", transcript, ep_meta)
+    # Transcribe
+    transcript = transcribe_audio(audio_file, whisper_model, timeout=transcribe_timeout)
+    if transcript:
+        # Overwrite with actual transcript
+        md_file = _save_episode(output_dir, seq, pub_date, eid, title, desc,
+                                duration, shownotes, "音频转录", transcript, ep_meta)
+    else:
+        print(f"    转录失败，保留元信息文件")
     return md_file
 
 
@@ -1283,7 +1431,7 @@ def cmd_crawl(args):
             all_episodes.extend(batch)
         elif isinstance(batch, dict):
             all_episodes.extend(batch.get("episodes", []))
-        load_more = data.get("loadMoreKey") or data.get("loadNextKey")
+        load_more = data.get("loadMoreKey")
         if not load_more:
             break
         payload["loadMoreKey"] = load_more
@@ -1311,6 +1459,8 @@ def cmd_crawl(args):
 
     # Filter to uncrawled episodes from target set
     crawled_eids = set(state["crawled"])
+    metadata_only_eids = set(state.get("metadata_only", []))
+    # Episodes that were metadata-only can be re-processed for transcription
     remaining = max_episodes - state["count"]
     uncrawled = []
     for ep in latest_episodes:
@@ -1397,7 +1547,7 @@ def cmd_crawl(args):
         time.sleep(0.3)
 
     # ── Pass 2: Audio transcription ──
-    if needs_transcription:
+    if needs_transcription and not getattr(args, 'no_transcribe', False):
         print("\n" + "=" * 60)
         print(f"【第2轮】音频转录 — {len(needs_transcription)} 集需要转录")
         print("=" * 60)
@@ -1427,12 +1577,38 @@ def cmd_crawl(args):
                 mb = audio_file.stat().st_size / 1024 / 1024
                 print(f"    音频已存在 ({mb:.1f}MB)，跳过下载")
 
-            transcript = transcribe_audio(audio_file, whisper_model)
+            transcript = transcribe_audio(audio_file, whisper_model,
+                                          timeout=getattr(args, 'transcribe_timeout', 0))
 
-            _save_episode(output_dir, seq, pub_date, eid, title, ep["description"],
-                          ep["duration"], ep["shownotes"], "音频转录", transcript,
-                          ep.get("ep_meta"))
-            state["crawled"].append(eid)
+            if transcript:
+                _save_episode(output_dir, seq, pub_date, eid, title, ep["description"],
+                              ep["duration"], ep["shownotes"], "音频转录", transcript,
+                              ep.get("ep_meta"))
+                state["crawled"].append(eid)
+                state["count"] += 1
+                _save_state(state_file, state)
+            else:
+                # Save metadata placeholder so progress isn't lost, but don't mark as fully crawled
+                placeholder = "[待转录: 音频已下载但转录失败，请稍后重试或使用 --reset]"
+                _save_episode(output_dir, seq, pub_date, eid, title, ep["description"],
+                              ep["duration"], ep["shownotes"], "音频转录", placeholder,
+                              ep.get("ep_meta"))
+                # Don't add to state["crawled"] — will be retried on next run
+                print(f"    转录失败，已保存元信息（下次运行将重试）")
+
+    # ── Pass 2b: Save metadata-only for skipped transcription ──
+    elif needs_transcription and getattr(args, 'no_transcribe', False):
+        print(f"\n跳过转录 (--no-transcribe)，保存 {len(needs_transcription)} 集元信息")
+        for ep in needs_transcription:
+            eid = ep["eid"]
+            placeholder = "[待转录: 使用 --no-transcribe 跳过转录。去掉 --no-transcribe 重新运行以获取转录文本]"
+            _save_episode(output_dir, ep["seq"], ep["pub_date"], eid, ep["title"],
+                          ep["description"], ep["duration"], ep["shownotes"],
+                          "音频转录", placeholder, ep.get("ep_meta"))
+            # Track separately so they can be re-run for transcription later
+            if "metadata_only" not in state:
+                state["metadata_only"] = []
+            state["metadata_only"].append(eid)
             state["count"] += 1
             _save_state(state_file, state)
 
@@ -1441,6 +1617,11 @@ def cmd_crawl(args):
     print(f"爬取完成! {podcast_title} — 共 {state['count']} 集")
     print(f"输出目录: {output_dir}")
     print("=" * 60)
+
+    # ── CSV Export ──
+    if getattr(args, 'csv', False):
+        print("\n导出 CSV...")
+        _export_csv(output_dir)
 
 
 def cmd_crawl_one(args):
@@ -1456,17 +1637,21 @@ def cmd_crawl_one(args):
     audio_dir = output_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
 
-    md_file = _process_single_episode(eid, seq, output_dir, audio_dir, config, args.whisper_model)
+    md_file = _process_single_episode(
+        eid, seq, output_dir, audio_dir, config,
+        args.whisper_model,
+        no_transcribe=getattr(args, "no_transcribe", False),
+        transcribe_timeout=getattr(args, "transcribe_timeout", 0),
+    )
     if md_file:
         print(f"\n完成! 输出: {md_file}")
+        if getattr(args, 'csv', False):
+            data = _parse_md_to_csv(md_file)
+            csv_path = output_dir / f"{data.get('播客', 'podcast')}_飞书导入.csv"
+            _save_csv_row(csv_path, data)
+            print(f"    CSV 已追加: {csv_path}")
     else:
         print(f"\n处理失败: {eid}")
-
-    # ── Summary ──
-    print("\n" + "=" * 60)
-    print(f"爬取完成! {podcast_title} — 共 {state['count']} 集")
-    print(f"输出目录: {output_dir}")
-    print("=" * 60)
 
 
 def _save_episode(output_dir, seq, pub_date, eid, title, desc, duration, shownotes, source, text, ep_meta=None):
@@ -1516,7 +1701,8 @@ def _save_episode(output_dir, seq, pub_date, eid, title, desc, duration, shownot
         # --- 简介 ---
         f.write(f"\n## 简介\n\n")
         if desc:
-            f.write(f"{desc}\n")
+            desc_text = _strip_html(desc) if '<' in desc else desc
+            f.write(f"{desc_text}\n")
         else:
             f.write(f"[待补充：请根据正文内容生成简介摘要]\n")
 
@@ -1544,6 +1730,137 @@ def _save_episode(output_dir, seq, pub_date, eid, title, desc, duration, shownot
 
     chars = len(text) if text else 0
     print(f"    已保存: {md_file} ({chars} 字)")
+    return md_file
+
+
+# ============================================================
+# CSV Export (for 飞书/Feishu import)
+# ============================================================
+
+CSV_COLUMNS = ["序号", "标题", "发布日期", "时长", "主播/嘉宾", "简介", "时间轴", "正文",
+               "单集ID", "内容来源", "播客"]
+
+
+def _parse_md_to_csv(md_path):
+    """Parse a post-processed episode .md file into a dict for CSV export."""
+    import re as _re
+    content = Path(md_path).read_text(encoding="utf-8")
+
+    result = {}
+
+    # Meta fields
+    m = _re.search(r'\*\*播客\*\*:\s*(.+)', content)
+    result["播客"] = m.group(1).strip() if m else ""
+
+    m = _re.search(r'\*\*发布日期\*\*:\s*(.+)', content)
+    result["发布日期"] = m.group(1).strip() if m else ""
+
+    m = _re.search(r'\*\*时长\*\*:\s*(.+)', content)
+    result["时长"] = m.group(1).strip() if m else ""
+
+    m = _re.search(r'\*\*单集ID\*\*:\s*(.+)', content)
+    result["单集ID"] = m.group(1).strip() if m else ""
+
+    m = _re.search(r'\*\*内容来源\*\*:\s*(.+)', content)
+    result["内容来源"] = m.group(1).strip() if m else ""
+
+    # 序号 from filename: NN_date_title.md
+    fname = Path(md_path).name
+    m = _re.match(r'^(\d+)_', fname)
+    result["序号"] = int(m.group(1)) if m else ""
+
+    # 标题 from first # heading
+    m = _re.search(r'^#\s+(.+)', content, _re.MULTILINE)
+    result["标题"] = m.group(1).strip() if m else ""
+
+    # 主播/嘉宾 — collect all lines under **主播/嘉宾**:
+    podcasters = []
+    lines = content.split('\n')
+    in_podcasters = False
+    for line in lines:
+        if '**主播/嘉宾**' in line:
+            in_podcasters = True
+            # Check if it's a single-line format
+            m2 = _re.match(r'.*\*\*主播/嘉宾\*\*:\s*(.+)', line)
+            if m2 and m2.group(1).strip():
+                podcasters.append(m2.group(1).strip())
+            continue
+        if in_podcasters:
+            if line.strip().startswith('- ') or line.strip().startswith('  -'):
+                p = line.strip().lstrip('- ').strip()
+                if p:
+                    podcasters.append(p)
+            elif line.strip() == '':
+                continue
+            else:
+                in_podcasters = False
+    result["主播/嘉宾"] = '\n'.join(podcasters)
+
+    # 简介 — between ## 简介 and ## 时间轴
+    m = _re.search(r'## 简介\s*\n+(.*?)(?=\n## )', content, _re.DOTALL)
+    result["简介"] = m.group(1).strip() if m else ""
+
+    # 时间轴 — between ## 时间轴 and ## 正文
+    m = _re.search(r'## 时间轴\s*\n+(.*?)(?=\n## )', content, _re.DOTALL)
+    result["时间轴"] = m.group(1).strip() if m else ""
+
+    # 正文 — after ## 正文
+    m = _re.search(r'## 正文\s*\n(.*)', content, _re.DOTALL)
+    body = m.group(1).strip() if m else ""
+    # Strip the whisper note blockquote if present
+    body = _re.sub(r'^> \[!note\]\n>.*?\n>.*?\n*', '', body, flags=_re.DOTALL)
+    result["正文"] = body.strip()
+
+    return result
+
+
+def _save_csv_row(csv_path, episode_data, write_header=False):
+    """Append one episode as a CSV row. Write BOM + header if write_header=True."""
+    import csv
+    needs_header = write_header or not Path(csv_path).exists()
+    is_new = not Path(csv_path).exists()
+
+    with open(csv_path, "a", encoding="utf-8-sig", newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction='ignore')
+        if is_new:
+            writer.writeheader()
+        writer.writerow(episode_data)
+
+
+def _export_csv(output_dir):
+    """Scan all .md files in output_dir and export to CSV."""
+    md_files = sorted(Path(output_dir).glob("*.md"))
+    if not md_files:
+        print("未找到 .md 文件")
+        return
+
+    # Determine podcast name from first file
+    first_data = _parse_md_to_csv(md_files[0])
+    podcast_name = first_data.get("播客", "podcast")
+
+    csv_path = Path(output_dir) / f"{podcast_name}_飞书导入.csv"
+
+    # Remove existing CSV to avoid duplicates
+    if csv_path.exists():
+        csv_path.unlink()
+
+    count = 0
+    for md_file in md_files:
+        data = _parse_md_to_csv(md_file)
+        _save_csv_row(csv_path, data)
+        count += 1
+
+    print(f"已导出 {count} 集到: {csv_path}")
+    return csv_path
+
+
+def cmd_export(args):
+    """Export existing .md files to CSV for 飞书 import."""
+    output_dir = Path(args.directory)
+    if not output_dir.is_dir():
+        print(f"错误: {output_dir} 不是目录")
+        return
+    _export_csv(output_dir)
 
 
 def _save_state(state_file, state):
@@ -1553,13 +1870,18 @@ def _save_state(state_file, state):
 
 
 def _strip_html(html_str):
-    """Simple HTML to plain text conversion."""
+    """Simple HTML to plain text conversion. Removes figure/image blocks cleanly."""
     import re as _re
     import html as _html
-    text = _re.sub(r'<br\s*/?>', '\n', html_str)
+    # Remove <figure>...</figure> blocks entirely (images in shownotes)
+    text = _re.sub(r'<figure[^>]*>.*?</figure>', '', html_str, flags=_re.DOTALL)
+    # Convert common tags to line breaks
+    text = _re.sub(r'<br\s*/?>', '\n', text)
     text = _re.sub(r'</p>', '\n', text)
+    # Remove remaining tags
     text = _re.sub(r'<[^>]+>', '', text)
     text = _html.unescape(text)
+    # Collapse excessive blank lines
     text = _re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -1576,7 +1898,8 @@ def main():
 示例:
   python xyz.py login --adb                     # 从 ADB 设备自动提取凭据（推荐）
   python xyz.py login -t TOKEN -d DEVICE_ID     # 手动输入凭据登录
-  python xyz.py search 忽左忽右                  # 搜索播客
+  python xyz.py search 忽左忽右                  # 搜索播客 (iTunes + 小宇宙)
+  python xyz.py search 科技前哨 -x                # 强制用小宇宙搜索独占播客
   python xyz.py episodes <podcast_id>            # 列出节目
   python xyz.py download <episode_id>            # 下载音频
   python xyz.py subtitles <episode_id> -f srt    # 获取字幕
@@ -1611,9 +1934,11 @@ def main():
     p_token.add_argument("--verify", "-v", action="store_true", help="验证 token 是否有效")
 
     # ---- search ----
-    p_search = sub.add_parser("search", help="搜索播客 (iTunes API，无需登录)")
+    p_search = sub.add_parser("search", help="搜索播客 (iTunes + 小宇宙 API)")
     p_search.add_argument("query", help="搜索关键词")
     p_search.add_argument("--limit", "-n", type=int, default=10, help="结果数量 (默认 10)")
+    p_search.add_argument("--xiaoyuzhou", "-x", action="store_true",
+                          help="强制使用小宇宙搜索 (跳过 iTunes，可搜独占播客)")
 
     # ---- podcast ----
     p_podcast = sub.add_parser("podcast", help="获取播客详情")
@@ -1661,10 +1986,16 @@ def main():
     p_crawl.add_argument("-n", "--max-episodes", type=int, default=10, help="爬取集数 (默认 10)")
     p_crawl.add_argument("-o", "--output", default=str(DEFAULT_OUTPUT_DIR / "crawl"),
                          help="输出目录 (默认 ./downloads/crawl)")
-    p_crawl.add_argument("--whisper-model", default="small",
+    p_crawl.add_argument("--whisper-model", default="base",
                          choices=["tiny", "base", "small", "medium", "large-v3"],
-                         help="Whisper 模型 (默认 small，需安装 faster-whisper)")
+                         help="Whisper 模型 (默认 base，需安装 faster-whisper)")
+    p_crawl.add_argument("--no-transcribe", action="store_true",
+                         help="无字幕时不转录，只保存元信息")
+    p_crawl.add_argument("--transcribe-timeout", type=int, default=0,
+                         help="单集转录超时秒数 (0=无限制)")
     p_crawl.add_argument("--reset", action="store_true", help="重置状态，从头开始")
+    p_crawl.add_argument("--csv", action="store_true",
+                         help="爬取结束后自动导出 CSV（飞书导入格式）")
 
     # ---- crawl-one ----
     p_crawl_one = sub.add_parser("crawl-one", help="处理单集（供逐集爬取使用）")
@@ -1672,9 +2003,19 @@ def main():
     p_crawl_one.add_argument("--seq", type=int, default=1, help="序号 (默认 1)")
     p_crawl_one.add_argument("-o", "--output", default=str(DEFAULT_OUTPUT_DIR / "crawl"),
                              help="输出目录")
-    p_crawl_one.add_argument("--whisper-model", default="small",
+    p_crawl_one.add_argument("--whisper-model", default="base",
                              choices=["tiny", "base", "small", "medium", "large-v3"],
-                             help="Whisper 模型 (默认 small)")
+                             help="Whisper 模型 (默认 base)")
+    p_crawl_one.add_argument("--no-transcribe", action="store_true",
+                             help="无字幕时不转录，只保存元信息")
+    p_crawl_one.add_argument("--transcribe-timeout", type=int, default=0,
+                             help="转录超时秒数 (0=无限制)")
+    p_crawl_one.add_argument("--csv", action="store_true",
+                             help="同时输出 CSV 行（飞书导入格式，追加到同目录 CSV 文件）")
+
+    # ---- export ----
+    p_export = sub.add_parser("export", help="将已有 .md 文件导出为 CSV（飞书导入格式）")
+    p_export.add_argument("directory", help="包含 .md 文件的目录")
 
     args = parser.parse_args()
 
@@ -1693,6 +2034,7 @@ def main():
         "subtitles": cmd_subtitles,
         "crawl": cmd_crawl,
         "crawl-one": cmd_crawl_one,
+        "export": cmd_export,
     }
 
     cmd_func = commands.get(args.command)

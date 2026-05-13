@@ -17,6 +17,7 @@
 
 | 端点 | 方法 | 功能 | 认证 |
 |------|------|------|------|
+| `/v1/search/create` | POST | 搜索播客/单集 | access_token |
 | `/v1/podcast/get?pid=xxx` | GET | 播客详情 | access_token |
 | `/v1/episode/list` | POST | 节目列表（分页） | access_token |
 | `/v1/episode/get?eid=xxx` | GET | 单集详情（含字幕） | access_token |
@@ -86,6 +87,32 @@ x-jike-access-token: <access_token>
 
 不再包含 `loadMoreKey` 时表示最后一页。每页建议间隔 0.5 秒。
 
+## 搜索
+
+小宇宙原生搜索 API：
+
+```
+POST /v1/search/create
+Headers: 标准 access_token 认证头
+Body: {"keyword": "搜索词", "type": "PODCAST"}
+→ Response:
+{
+  "data": [
+    {
+      "pid": "643928f99361a4e7c38a9555",
+      "title": "播客名",
+      "author": "作者",
+      "brief": "简介",
+      "episodeCount": 56,
+      "subscriptionCount": 1234
+    }
+  ]
+}
+```
+
+`type` 可选值：`"PODCAST"`（播客）、`"EPISODE"`（单集）。
+分页：响应含 `loadMoreKey` 时，下一次请求带上 `loadMoreKey` 和 `searchId`。
+
 ## 字幕格式
 
 API 返回词级 JSON 数组：
@@ -104,6 +131,18 @@ API 返回词级 JSON 数组：
 GET /v1/private-media/get?eid=<episode_id>
 → {"data": {"url": "https://audio-cdn..."}}
 ```
+
+## 转录（Transcript）
+
+单集数据中存在 `transcriptMediaId` 字段（如 `"pid/filename.m4a"`），暗示服务端有转录数据。
+但已测试以下候选端点均返回 404（2026-05-13 探测）：
+- `GET /v1/transcript/get?eid=xxx`
+- `GET /v1/transcript/get?mediaId=xxx`
+- `POST /v1/transcript/get` body `{"eid": xxx}`
+- `GET /v1/episode/transcript?eid=xxx`
+- `POST /v1/transcript/create`
+
+结论：转录 API 暂未公开，仍需使用本地 faster-whisper 转录。
 
 ## 配置文件
 

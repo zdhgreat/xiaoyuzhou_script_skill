@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Output
+output/
+downloads/
+*.csv
+
+# Credentials
+credentials.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary audio conversion files
+*.wav
+
+# Claude Code
+.claude/
