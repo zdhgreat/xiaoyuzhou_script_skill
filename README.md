@@ -90,22 +90,6 @@ Root 权限已获取 (模式: ADB Root)
   Token 已保存到: ~/.xiaoyuzhou/credentials.json
 ```
 
-**如果自动提取失败**，可以手动抓包获取凭据：
-
-1. 安装 mitmproxy: `pip install mitmproxy`
-2. 运行 `mitmweb -p 8080`
-3. 在模拟器中设置 WiFi 代理为电脑 IP:8080
-4. 在模拟器浏览器打开 `mitm.it` 安装证书
-5. 打开小宇宙 App 随便浏览
-6. 在电脑浏览器 `http://127.0.0.1:8081` 找到 `api.xiaoyuzhoufm.com` 的请求
-7. 复制请求头中 `x-jike-refresh-token` 和 `x-jike-device-id`
-
-```bash
-python scripts/xyz.py login -t <refresh_token> -d <device_id>
-```
-
-> 抓完后记得把模拟器代理设置改回"无"。
-
 ## 功能说明
 
 ### 搜索播客
@@ -170,7 +154,7 @@ python scripts/xyz.py crawl <播客ID> --reset
 **输出目录**（按播客名建文件夹，按发布日期排序）：
 ```
 output/
-└── AI局内人 | AGI Insider/
+└── xxxxx /
     ├── 01_2024-06-17_Vol20...md     # 最早
     ├── ...
     ├── 15_2025-01-23_Vol28...md     # 最新
@@ -218,7 +202,6 @@ Token 在 API 返回 401 时会自动刷新。`refresh_token` 过期后需重新
 
 | 问题 | 解决方案 |
 |------|---------|
-| 短信登录失败 (error 1003) | 短信登录已封禁，使用 `login --adb` 或手动抓包 |
 | ADB 连不上设备 | 确保模拟器已启动；尝试端口 7555、62001、5555 |
 | MuMu 找不到 ADB | 检查安装路径，通常在 `C:\Program Files\Netease\MuMu\nx_main\adb.exe` |
 | su 命令失败 | MuMu 默认 adb root 不需要 su；夜神需在设置中开启 Root |
