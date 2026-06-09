@@ -18,18 +18,23 @@ allowed-tools: ["Bash", "Read", "Write"]
 ## 前置条件
 
 - Python 3.10+
-- **核心依赖**: `pip install requests`
-- **音频转录**（可选）: `pip install faster-whisper` + 系统安装 `ffmpeg`
+- **环境配置**: 运行 SKILL_SETUP.md 完成依赖安装和 `.env` 配置
+- **核心依赖**: `pip install -r requirements.txt`（含 faster-whisper, psycopg2-binary 等）
+- **预下载模型**: `python xyz.py setup`
+- **系统依赖**: `ffmpeg`（音频转录必需）
 - ADB 工具（用于 `--adb` 自动提取模式）：MuMu 模拟器自带 adb（推荐），夜神模拟器自带 nox_adb，或安装 Android SDK Platform Tools
 
 ## 核心脚本
 
 ```
-${CLAUDE_SKILL_DIR}/scripts/xyz.py          # 主工具（所有功能）
-${CLAUDE_SKILL_DIR}/scripts/extract_creds.py # ADB 凭据提取工具
+{baseDir}/scripts/xyz.py          # 主工具（所有爬取/操作功能）
+{baseDir}/scripts/query_db.py     # 数据库只读查询工具
+{baseDir}/scripts/extract_creds.py # ADB 凭据提取工具
 ```
 
-所有功能通过子命令调用：
+> **数据库查询**：`query_db.py` 是独立的只读查询工具，完整文档见 `SKILL_QUERY.md`。
+
+所有功能通过子命令调用（`xyz.py`）：
 
 | 子命令 | 功能 | 需要登录 |
 |--------|------|----------|
@@ -42,9 +47,14 @@ ${CLAUDE_SKILL_DIR}/scripts/extract_creds.py # ADB 凭据提取工具
 | `episode` | 单集详情 | 是 |
 | `download` | 下载音频 | 是 |
 | `subtitles` | 获取字幕 | 是 |
+| `setup` | 预下载 Whisper 模型（安装时使用） | 否 |
 | `crawl` | 批量爬取播客（字幕优先+转录兜底，逐集后处理） | 是 |
 | `crawl-one` | 处理单集（供逐集爬取+后处理使用） | 是 |
 | `export` | 将已有 .md 文件导出为 CSV（飞书导入格式） | 否 |
+| `list-accounts` | 列出所有已登录账户 | 否 |
+| `serve` | 守护进程模式：自动循环爬取 | 是 |
+
+**多账号支持**：所有命令支持 `--account NAME` / `-A NAME` 参数，指定使用哪个账户。不指定时使用默认账户。
 
 ## 工作流程
 
@@ -57,34 +67,55 @@ ${CLAUDE_SKILL_DIR}/scripts/extract_creds.py # ADB 凭据提取工具
 前提：MuMu/夜神模拟器或真机上已安装小宇宙 App 并已登录。
 
 ```bash
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" login --adb
+python "{baseDir}/scripts/xyz.py" login --adb
 ```
 
 自动检测 ADB 设备，提取 `refresh_token` 和 `device_id`，保存并验证。
 
 也可以单独运行提取工具：
 ```bash
-python "${CLAUDE_SKILL_DIR}/scripts/extract_creds.py" --verify
+python "{baseDir}/scripts/extract_creds.py" --verify
 ```
 
 #### 方式二：手动输入凭据
 
 ```bash
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" login \
+python "{baseDir}/scripts/xyz.py" login \
   --refresh-token <从抓包获取的refresh_token> \
   --device-id <从抓包获取的device_id>
 ```
 
 Token 保存在 `~/.xiaoyuzhou/credentials.json`，后续自动使用。
 
+#### 多账号登录（MuMu 多开）
+
+MuMu 模拟器支持多开实例（每个实例使用连续端口：7555、7556、7557...），每个实例可登录不同账号：
+
+```bash
+# 列出已登录账户
+python "{baseDir}/scripts/xyz.py" list-accounts
+
+# MuMu 实例1 (端口 7555) → 账号 phone1
+python "{baseDir}/scripts/xyz.py" login --adb --device 127.0.0.1:7555 --account phone1
+
+# MuMu 实例2 (端口 7556) → 账号 phone2
+python "{baseDir}/scripts/xyz.py" login --adb --device 127.0.0.1:7556 --account phone2
+
+# 使用指定账户操作
+python "{baseDir}/scripts/xyz.py" search "播客名" --account phone1
+python "{baseDir}/scripts/xyz.py" crawl-one <eid> --seq 1 --account phone2 -o "./output/播客名"
+```
+
+账户配置文件存储在 `~/.xiaoyuzhou/profiles/<账户名>.json`，默认账户仍在 `~/.xiaoyuzhou/credentials.json`。
+
 ### 第二步：搜索播客
 
 ```bash
 # 默认先搜 iTunes，无结果时自动 fallback 到小宇宙搜索
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" search "播客名"
+python "{baseDir}/scripts/xyz.py" search "播客名"
 
 # 强制使用小宇宙搜索（可搜到独占播客，需登录）
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" search "播客名" -x
+python "{baseDir}/scripts/xyz.py" search "播客名" -x
 ```
 
 搜索流程：先走 iTunes API（无需登录，速度快），如果没找到结果，自动 fallback 到小宇宙原生搜索 API（需要登录）。
@@ -96,26 +127,26 @@ python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" search "播客名" -x
 
 ```bash
 # 获取播客信息
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" podcast <播客ID或URL>
+python "{baseDir}/scripts/xyz.py" podcast <播客ID或URL>
 
 # 获取节目列表（支持分页）
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" episodes <播客ID> --max-pages 3
+python "{baseDir}/scripts/xyz.py" episodes <播客ID> --max-pages 3
 ```
 
 ### 第四步：获取详情或下载
 
 ```bash
 # 获取单集详情（含字幕数据）
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" episode <单集ID或URL>
+python "{baseDir}/scripts/xyz.py" episode <单集ID或URL>
 
 # 下载音频（默认启用断点续传）
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" download <单集ID> -o ./output --with-subtitles
+python "{baseDir}/scripts/xyz.py" download <单集ID> -o ./output --with-subtitles
 
 # 强制重新下载（忽略已存在文件）
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" download <单集ID> -o ./output --force
+python "{baseDir}/scripts/xyz.py" download <单集ID> -o ./output --force
 
 # 单独获取字幕（默认输出全部格式：srt+txt+json）
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" subtitles <单集ID> -f srt
+python "{baseDir}/scripts/xyz.py" subtitles <单集ID> -f srt
 ```
 
 ### 第五步：批量爬取（逐集处理）
@@ -137,8 +168,8 @@ python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" subtitles <单集ID> -f srt
 步骤：
 1. 获取播客信息和节目列表：
 ```bash
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" podcast <播客ID>
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" episodes <播客ID> --max-pages 3
+python "{baseDir}/scripts/xyz.py" podcast <播客ID>
+python "{baseDir}/scripts/xyz.py" episodes <播客ID> --max-pages 3
 ```
 
 2. 根据节目列表，按发布日期从旧到新排序，确定每集的序号（01, 02, ...）
@@ -146,16 +177,13 @@ python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" episodes <播客ID> --max-pages 3
 3. **逐集处理**——对每一集重复以下步骤：
 ```bash
 # 处理单集（自动检测字幕/转录）
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" crawl-one <单集ID> --seq <序号> -o "./output/<播客名>"
-
-# 只保存元信息（无字幕时不转录音频）
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" crawl-one <单集ID> --seq 1 --no-transcribe
+python "{baseDir}/scripts/xyz.py" crawl-one <单集ID> --seq <序号> -o "./output/<播客名>"
 
 # 限制转录时间（10分钟超时）
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" crawl-one <单集ID> --seq 1 --transcribe-timeout 600
+python "{baseDir}/scripts/xyz.py" crawl-one <单集ID> --seq 1 --transcribe-timeout 600
 
 # 指定 whisper 模型
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" crawl-one <单集ID> --seq 1 --whisper-model tiny
+python "{baseDir}/scripts/xyz.py" crawl-one <单集ID> --seq 1 --whisper-model tiny
 ```
 > **注意**：`crawl-one` 的 `-o` 参数直接作为输出目录（不会自动创建播客名子文件夹），而 `crawl` 会自动在 `-o` 下创建播客名子文件夹。
    - 先保存元信息 .md，即使转录超时也不会丢失节目信息
@@ -193,7 +221,7 @@ python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" crawl-one <单集ID> --seq 1 --whisp
 
 00:00 开场：AI Agent有能力却无合法身份
 01:30 AI Agent的现状困境：想工作却没有身份
-03:00 AI Agent技术突破：OpenClaw、Claude Code、A2A协议
+03:00 AI Agent技术突破：开源工具、MCP协议、A2A协议
 05:00 核心障碍：AI缺少"经济身份证"
 
 ## 正文
@@ -204,7 +232,7 @@ python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" crawl-one <单集ID> --seq 1 --whisp
 ### 01:30 AI Agent的现状困境：想工作却没有身份
 （对应正文内容...）
 
-### 03:00 AI Agent技术突破：OpenClaw、Claude Code、A2A协议
+### 03:00 AI Agent技术突破：开源工具、MCP协议、A2A协议
 （对应正文内容...）
 ```
 
@@ -212,11 +240,10 @@ python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" crawl-one <单集ID> --seq 1 --whisp
 
 **备选方式：批量 crawl**（一次性爬取所有集，后处理在全部完成后进行）
 ```bash
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" crawl <播客ID> -n 10 -o ./output --whisper-model base
+python "{baseDir}/scripts/xyz.py" crawl <播客ID> -n 10 -o ./output --whisper-model base
 ```
 - `-n` 获取最新 N 集（默认10），按发布日期升序编号
 - `--whisper-model` 默认 base，可选 tiny/base/small/medium/large-v3
-- `--no-transcribe` 无字幕时不转录，只保存元信息（下次去掉此参数可重新转录）
 - `--transcribe-timeout` 限制单集转录时间（秒），0=无限制
 - `--reset` 清除爬取进度，从头开始
 
@@ -241,6 +268,40 @@ output/
 - 内置字幕：有标点断句，质量高，通常只需补充简介/时间轴
 - 音频转录：原始文本**无标点断句**，可能存在识别错误（人名、术语等），需要重点后处理
 
+### 多账号并行爬取
+
+> 使用多个小宇宙账号同时爬取不同集数，提高速度。
+
+**前置条件**：已通过 MuMu 多开登录多个账号（见"多账号登录"章节）。
+
+**并行爬取流程**：
+
+1. 获取播客信息和节目列表（任意一个账号即可）：
+```bash
+python "{baseDir}/scripts/xyz.py" podcast <播客ID>
+python "{baseDir}/scripts/xyz.py" episodes <播客ID> --max-pages 3
+```
+
+2. 将集数分配给不同账号，**并行执行** `crawl-one`：
+```bash
+# 账号A爬第1集
+python "{baseDir}/scripts/xyz.py" crawl-one <eid1> --seq 1 --account phone1 -o "./output/播客名" &
+
+# 账号B爬第2集（同时进行）
+python "{baseDir}/scripts/xyz.py" crawl-one <eid2> --seq 2 --account phone2 -o "./output/播客名" &
+
+wait
+```
+
+3. 每集爬完后**立即后处理**（逐集流程不变），然后继续下一集。
+
+4. 全部完成后导出 CSV：
+```bash
+python "{baseDir}/scripts/xyz.py" export "./output/播客名"
+```
+
+> **注意**：并行 `crawl-one` 共享同一输出目录和 `audio/` 子目录，但每个集数有独立文件名，不会冲突。CSV 导出建议在全部爬取完成后统一执行，避免并行写入冲突。
+
 **其他输出**：
 - `audio/` — 下载的音频文件（m4a）
 - `crawl_state.json` — 爬取状态（支持断点续爬）。包含 `crawled`（已完成）和 `metadata_only`（仅元信息，可重新转录）
@@ -253,15 +314,15 @@ output/
 **方式一：爬取时自动导出**
 ```bash
 # crawl 批量爬取结束后自动生成 CSV
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" crawl <播客ID> -n 10 --csv -o ./output
+python "{baseDir}/scripts/xyz.py" crawl <播客ID> -n 10 --csv -o ./output
 
 # crawl-one 逐集追加 CSV 行
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" crawl-one <单集ID> --seq 1 --csv -o "./output/<播客名>"
+python "{baseDir}/scripts/xyz.py" crawl-one <单集ID> --seq 1 --csv -o "./output/<播客名>"
 ```
 
 **方式二：对已有 MD 文件批量导出**
 ```bash
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" export "./output/<播客名>"
+python "{baseDir}/scripts/xyz.py" export "./output/<播客名>"
 ```
 
 **CSV 列定义**（11 列）：
@@ -287,14 +348,38 @@ python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" export "./output/<播客名>"
 4. 映射列（自动识别），时间轴和正文列设为"多行文本"类型
 5. 导入完成
 
+### 守护进程模式（serve）
+
+自动循环爬取：刷新 token → 爬取 → 休息，适合长期无人值守运行。
+
+```bash
+# 基本用法：每 6 小时爬取一次，每次最多 10 集
+python "{baseDir}/scripts/xyz.py" serve --pids <PID1> <PID2> --interval 6
+
+# 指定参数
+python "{baseDir}/scripts/xyz.py" serve \
+  --pids <PID1> <PID2> \
+  --interval 4 \
+  --max-episodes 5
+
+# 参数说明：
+# --interval N       爬取间隔（小时，默认 6）
+# --max-episodes N   每轮最多爬取集数（默认 10）
+# --pids PID1 PID2   指定播客 PID 列表
+```
+
+- 支持 SIGINT/SIGTERM 优雅退出
+- token 刷新失败时自动告警，写入 `crawler_alerts.jsonl`
+- 不指定 `--pids` 时会提示无可爬目标
+
 ## Token 管理
 
 Token 会在 API 返回 401 时自动刷新，通常不需要手动操作。
 
 ```bash
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" token
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" token --refresh
-python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" token --verify
+python "{baseDir}/scripts/xyz.py" token
+python "{baseDir}/scripts/xyz.py" token --refresh
+python "{baseDir}/scripts/xyz.py" token --verify
 ```
 
 ## Gotchas（已知坑）
@@ -323,6 +408,8 @@ python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" token --verify
 |----|------|
 | 短信登录已失效 | sendCode API 返回错误 1003，推荐使用 `--adb` 自动提取方式登录 |
 | ADB 自动提取 | 需要 Root 权限（MuMu 模拟器默认 adb root，夜神需手动开启） |
+| MuMu 多开端口 | 实例0=7555, 实例1=7556, 实例2=7557...，用 `--device 127.0.0.1:PORT` 指定 |
+| 多账号配置 | 默认 `credentials.json`，命名账户存在 `profiles/<名称>.json` |
 | Token 位置 | iOS 模式 token 在 response body，Android 模式在 response headers |
 | SSL 验证 | API 请求需关闭 SSL 验证（verify=False），脚本已处理 |
 | device_id 必须匹配 | refresh_token 和 device_id 必须来自同一设备/同一会话 |
@@ -339,3 +426,13 @@ python "${CLAUDE_SKILL_DIR}/scripts/xyz.py" token --verify
 - 登录时验证码发送失败，不重试（避免短信轰炸）
 - 下载中断后可使用断点续传恢复（默认开启）
 - 爬取支持断点续爬（通过 crawl_state.json 记录进度）
+
+## PostgreSQL 集成
+
+PG 集成通过 `.env` 配置（参见 SKILL_SETUP.md Step 3）。
+
+- **query_db.py** (`scripts/query_db.py`): 只读查询已爬取内容，使用 `POSTGRES_READONLY_USER`
+- **hub_adapter.py** (仓库根目录): Hub 爬取生命周期管理，使用 `POSTGRES_USER` 读写
+- **xyz.py** (核心爬虫): 不直接依赖 PG，PG 不可用时爬取功能不受影响
+
+PG 同步由 `hub_adapter.py` 调用 `xyz.py` 后解析输出实现。如需 PG 同步，请参考根目录的 `hub_adapter.py` 和 `schema.sql`。

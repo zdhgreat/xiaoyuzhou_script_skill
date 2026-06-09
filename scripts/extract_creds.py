@@ -38,18 +38,36 @@ SHARED_PREFS_DIR = f"/data/data/{PKG}/shared_prefs"
 CONFIG_DIR = Path.home() / ".xiaoyuzhou"
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 
-# Emulator ADB default paths (Windows)
-EMU_ADB_PATHS = [
-    # MuMu emulator (priority)
-    r"C:\Program Files\Netease\MuMu\nx_main\adb.exe",
-    r"D:\Program Files\Netease\MuMu\nx_main\adb.exe",
-    r"C:\Program Files\Netease\MuMuPlayer-12.0\shell\adb.exe",
-    # Nox emulator
-    r"C:\Program Files\Nox\bin\nox_adb.exe",
-    r"C:\Program Files (x86)\Nox\bin\nox_adb.exe",
-    r"D:\Program Files\Nox\bin\nox_adb.exe",
-    r"D:\Nox\bin\nox_adb.exe",
-]
+# Emulator ADB default paths
+_is_windows = platform.system() == "Windows"
+_home = str(Path.home())
+
+EMU_ADB_PATHS = []
+if _is_windows:
+    EMU_ADB_PATHS = [
+        # MuMu emulator (priority)
+        r"C:\Program Files\Netease\MuMu\nx_main\adb.exe",
+        r"D:\Program Files\Netease\MuMu\nx_main\adb.exe",
+        r"C:\Program Files\Netease\MuMuPlayer-12.0\shell\adb.exe",
+        # Nox emulator
+        r"C:\Program Files\Nox\bin\nox_adb.exe",
+        r"C:\Program Files (x86)\Nox\bin\nox_adb.exe",
+        r"D:\Program Files\Nox\bin\nox_adb.exe",
+        r"D:\Nox\bin\nox_adb.exe",
+    ]
+else:
+    EMU_ADB_PATHS = [
+        # Android SDK (Homebrew or manual install)
+        f"{_home}/Library/Android/sdk/platform-tools/adb",
+        "/usr/local/bin/adb",
+        "/opt/homebrew/bin/adb",
+        # MuMu emulator for Mac
+        "/Applications/MuMuPlayer.app/Contents/MacOS/MuMuEmulator.app/Contents/MacOS/adb",
+        "/Applications/MuMuPlayer.app/Contents/MacOS/adb",
+        f"{_home}/Library/Application Support/MuMu/tools/adb",
+        # Nox emulator for Mac
+        "/Applications/Nox App Player.app/Contents/MacOS/adb",
+    ]
 
 
 # ============================================================
@@ -155,28 +173,40 @@ def list_devices(adb_path):
     return devices
 
 
+def discover_mumu_instances(adb_path, start=7555, end=7565):
+    """Scan for MuMu emulator instances on consecutive ports.
+
+    Returns list of connected serial strings like ['127.0.0.1:7555', '127.0.0.1:7556'].
+    """
+    found = []
+    for port in range(start, end + 1):
+        target = f"127.0.0.1:{port}"
+        r = adb_run(adb_path, ["connect", target])
+        if r and ("connected" in (r.stdout or "").lower()
+                  or "already connected" in (r.stdout or "").lower()):
+            found.append(target)
+    return found
+
+
 def select_device(adb_path, preferred_serial=None):
     """Select a device. Returns serial string."""
     devices = list_devices(adb_path)
 
     if not devices:
-        print("未检测到已连接的设备。")
-        print("提示:")
-        print("  - 确保 MuMu/夜神模拟器已启动")
-        print("  - 真机需要开启 USB 调试或无线调试")
-        print()
-        # Try auto-connect common emulator ports
-        ports = ["7555", "62001", "5555", "16384"]
-        for port in ports:
+        print("未检测到已连接的设备，正在扫描模拟器...")
+        # Scan MuMu multi-instance consecutive ports
+        mumu_devices = discover_mumu_instances(adb_path)
+        if mumu_devices:
+            print(f"  发现 {len(mumu_devices)} 个 MuMu 实例: {', '.join(mumu_devices)}")
+
+        # Try other emulator ports
+        for port in ["62001", "5555", "16384"]:
             target = f"127.0.0.1:{port}"
-            print(f"  尝试连接 {target}...")
-            r = adb_run(adb_path, ["connect", target])
-            if r and "connected" in (r.stdout or "").lower():
-                print(f"  已连接 {target}")
-                return target
-            elif r and "already connected" in (r.stdout or "").lower():
-                print(f"  已连接 {target}")
-                return target
+            if target not in mumu_devices:
+                r = adb_run(adb_path, ["connect", target])
+                if r and ("connected" in (r.stdout or "").lower()
+                          or "already connected" in (r.stdout or "").lower()):
+                    print(f"  已连接 {target}")
 
         # Retry device listing
         devices = list_devices(adb_path)

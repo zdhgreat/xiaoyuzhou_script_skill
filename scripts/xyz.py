@@ -20,6 +20,7 @@ if sys.platform == "win32":
   episode    - 获取单集详情（含字幕）
   download   - 下载音频（支持断点续传）
   subtitles  - 获取并转换字幕（SRT/TXT/JSON）
+  setup      - 预下载 Whisper 模型（安装时使用）
 
 用法示例:
   python xyz.py login --refresh-token TOKEN --device-id DEVICE_ID
@@ -49,6 +50,9 @@ except ImportError:
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Hub 集成已迁移到 hub_adapter.py（仓库根目录）
+# skill 本体不再依赖 PostgreSQL
+
 
 class APIError(Exception):
     """Raised when an API request fails. Allows batch operations to continue."""
@@ -62,6 +66,7 @@ class APIError(Exception):
 BASE_URL = "https://api.xiaoyuzhoufm.com"
 CONFIG_DIR = Path.home() / ".xiaoyuzhou"
 CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
+PROFILES_DIR = CONFIG_DIR / "profiles"
 DEFAULT_OUTPUT_DIR = Path.cwd() / "downloads"
 
 
@@ -69,18 +74,35 @@ DEFAULT_OUTPUT_DIR = Path.cwd() / "downloads"
 # Config Management
 # ============================================================
 
-def load_config():
-    """Load credentials from local file."""
-    if CREDENTIALS_FILE.exists():
-        with open(CREDENTIALS_FILE, "r", encoding="utf-8") as f:
+def _config_path(account=None):
+    """Return the config file path for a given account (or default)."""
+    if account:
+        return PROFILES_DIR / f"{account}.json"
+    return CREDENTIALS_FILE
+
+
+def load_config(account=None):
+    """Load credentials from local file.
+
+    If account is None, uses default credentials.json (backward compatible).
+    If account is a string, loads from profiles/<account>.json.
+    """
+    fpath = _config_path(account)
+    if fpath.exists():
+        with open(fpath, "r", encoding="utf-8") as f:
             return json.load(f)
+    if account:
+        print(f"错误: 账户 '{account}' 不存在")
+        print(f"  先登录: python xyz.py login --account {account} --adb")
+        sys.exit(1)
     return {}
 
 
-def save_config(config):
+def save_config(config, account=None):
     """Save credentials to local file."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CREDENTIALS_FILE, "w", encoding="utf-8") as f:
+    fpath = _config_path(account)
+    fpath.parent.mkdir(parents=True, exist_ok=True)
+    with open(fpath, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 
@@ -224,11 +246,22 @@ def create_session():
     return session
 
 
+_GLOBAL_SESSION = None
+
+
+def get_session():
+    """Return a reusable requests session."""
+    global _GLOBAL_SESSION
+    if _GLOBAL_SESSION is None:
+        _GLOBAL_SESSION = create_session()
+    return _GLOBAL_SESSION
+
+
 # ============================================================
 # Authentication
 # ============================================================
 
-def refresh_access_token(config):
+def refresh_access_token(config, account=None):
     """Refresh access_token using refresh_token.
 
     iOS mode: POST, tokens from response BODY (fallback headers).
@@ -267,13 +300,10 @@ def refresh_access_token(config):
         )
 
     if resp.status_code == 401:
-        print("错误: refresh_token 已过期，请重新登录")
-        print("  运行: python xyz.py login")
-        sys.exit(1)
+        raise APIError("refresh_token 已过期，请重新登录 (python xyz.py login)")
 
     if resp.status_code != 200:
-        print(f"错误: 刷新 token 失败 [{resp.status_code}] {resp.text[:200]}")
-        sys.exit(1)
+        raise APIError(f"刷新 token 失败 [{resp.status_code}] {resp.text[:200]}")
 
     # Extract tokens: try body first (iOS), then headers (Android fallback)
     new_access = None
@@ -297,42 +327,57 @@ def refresh_access_token(config):
         config["refresh_token"] = new_refresh
 
     config["last_refresh"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    save_config(config)
+    save_config(config, account=account)
     return config
 
 
-def ensure_auth(config):
+def ensure_auth(config, account=None):
     """Ensure we have a valid access_token, refreshing if needed."""
     if "access_token" not in config:
         if "refresh_token" in config:
-            print("access_token 缺失，正在用 refresh_token 刷新...")
-            return refresh_access_token(config)
-        print("错误: 未登录，请先运行: python xyz.py login")
-        sys.exit(1)
+            return refresh_access_token(config, account=account)
+        raise APIError("未登录，请先运行: python xyz.py login")
     return config
 
 
-def api_request(method, path, config, **kwargs):
+def _log_risk(event_type: str, code: int, msg: str, api: str, *, account=None):
+    """记录风控事件到本地日志。Hub 集成由 hub_adapter.py 处理。"""
+    label = account.get("label", "default") if isinstance(account, dict) else str(account or "default")
+    print(f"  [risk] {event_type}: code={code} api={api} account={label} msg={msg[:60]}")
+
+
+def api_request(method, path, config, account=None, **kwargs):
     """Make an authenticated API request with auto-retry on 401.
 
     Raises APIError on failure instead of sys.exit, so batch operations can continue.
     """
-    config = ensure_auth(config)
-    session = create_session()
+    config = ensure_auth(config, account=account)
+    session = get_session()
     headers = get_auth_headers(config)
 
     url = f"{BASE_URL}{path}" if path.startswith("/") else path
 
-    resp = session.request(method, url, headers=headers, verify=False, **kwargs)
+    try:
+        resp = session.request(method, url, headers=headers, verify=False, **kwargs)
+    except requests.exceptions.RequestException as e:
+        raise APIError(f"网络错误: {e}")
 
     # Auto-refresh on 401
     if resp.status_code == 401:
-        config = refresh_access_token(config)
+        try:
+            config = refresh_access_token(config, account=account)
+        except APIError:
+            _log_risk("auth_expired", 401, f"Token refresh failed: {path}", path, account=account)
+            raise  # Re-raise auth failures
         headers = get_auth_headers(config)
         headers["Content-Type"] = "application/json"
-        resp = session.request(method, url, headers=headers, verify=False, **kwargs)
+        try:
+            resp = session.request(method, url, headers=headers, verify=False, **kwargs)
+        except requests.exceptions.RequestException as e:
+            raise APIError(f"网络错误 (重试后): {e}")
 
     if resp.status_code != 200:
+        _log_risk("risk_control", resp.status_code, f"API error: {path}", path, account=account)
         msg = f"API 错误 [{resp.status_code}]: {path} — {resp.text[:300]}"
         raise APIError(msg)
 
@@ -386,7 +431,8 @@ def get_audio_ext(url):
 
 def cmd_login(args):
     """Login via ADB auto-extract, refresh_token + device_id, or SMS (deprecated)."""
-    config = load_config()
+    account = getattr(args, 'account', None)
+    config = load_config(account)
 
     # --- ADB auto-extract mode (recommended) ---
     if getattr(args, "adb", False):
@@ -409,7 +455,7 @@ def cmd_login(args):
 
         config.update(creds)
         config["mode"] = args.mode or "android"
-        save_config(config)
+        save_config(config, account=account)
 
         # If we extracted an access_token, try using it directly first
         if "access_token" in creds:
@@ -435,7 +481,7 @@ def cmd_login(args):
 
         print("正在用 refresh_token 刷新...")
         try:
-            config = refresh_access_token(config)
+            config = refresh_access_token(config, account=account)
         except (SystemExit, APIError):
             print("\n验证失败: 提取的凭据可能已过期")
             print("请在小宇宙 App 中重新登录后再试")
@@ -462,12 +508,12 @@ def cmd_login(args):
         config["refresh_token"] = rt
         config["device_id"] = did
         config["mode"] = args.mode or "ios"
-        save_config(config)
+        save_config(config, account=account)
 
         # Validate by refreshing the access_token
         print("正在验证凭证...")
         try:
-            config = refresh_access_token(config)
+            config = refresh_access_token(config, account=account)
         except (SystemExit, APIError):
             print("\n验证失败: refresh_token 可能已过期或不匹配 device_id")
             print("请确保 refresh_token 和 device_id 来自同一设备/同一会话")
@@ -496,7 +542,7 @@ def cmd_login(args):
         config["device_properties"] = generate_device_properties(config["device_id"])
         print(f"已生成设备指纹 (Android)")
 
-    save_config(config)
+    save_config(config, account=account)
 
     phone = args.phone or input("请输入手机号: ").strip()
     if not phone:
@@ -572,7 +618,7 @@ def cmd_login(args):
     config["refresh_token"] = refresh_token
     config["phone"] = phone
     config["login_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    save_config(config)
+    save_config(config, account=account)
 
     print(f"\n登录成功! (模式: {mode})")
     print(f"  Token 已保存到: {CREDENTIALS_FILE}")
@@ -582,13 +628,14 @@ def cmd_login(args):
 
 def cmd_token(args):
     """Check or refresh token status."""
-    config = load_config()
+    account = getattr(args, 'account', None)
+    config = load_config(account)
 
     if not config:
         print("未找到配置文件，请先登录: python xyz.py login")
         return
 
-    print(f"配置文件: {CREDENTIALS_FILE}")
+    print(f"配置文件: {_config_path(account)}")
     print(f"  模式:        {config.get('mode', 'N/A')}")
     print(f"  手机号:      {config.get('phone', 'N/A')}")
     print(f"  登录时间:    {config.get('login_time', 'N/A')}")
@@ -598,13 +645,13 @@ def cmd_token(args):
 
     if args.refresh:
         print("\n正在刷新 token...")
-        config = refresh_access_token(config)
+        config = refresh_access_token(config, account=account)
         print("Token 已刷新!")
 
     if args.verify:
         print("\n正在验证 token...")
         try:
-            data = api_request("GET", "/v1/profile/get", config)
+            data = api_request("GET", "/v1/profile/get", config, account=account)
             user = data.get("data", data)
             nickname = user.get("nickname", "Unknown")
             print(f"Token 有效! 当前用户: {nickname}")
@@ -699,7 +746,7 @@ def cmd_search(args):
     if not force_xyz:
         print("iTunes 未找到结果，尝试小宇宙搜索...")
 
-    config = load_config()
+    config = load_config(getattr(args, 'account', None))
     if not config.get("access_token") and not config.get("refresh_token"):
         print("未找到相关播客")
         print("提示: 小宇宙搜索需要登录。运行 python xyz.py login 后可搜索小宇宙独占播客")
@@ -732,8 +779,9 @@ def cmd_search(args):
 def cmd_podcast(args):
     """Get podcast details."""
     podcast_id = parse_input(args.id)
-    config = load_config()
-    data = api_request("GET", f"/v1/podcast/get?pid={podcast_id}", config)
+    account = getattr(args, 'account', None)
+    config = load_config(account)
+    data = api_request("GET", f"/v1/podcast/get?pid={podcast_id}", config, account=account)
 
     podcast = data.get("data", data)
 
@@ -764,7 +812,8 @@ def cmd_podcast(args):
 def cmd_episodes(args):
     """List episodes of a podcast with pagination."""
     podcast_id = parse_input(args.podcast_id)
-    config = load_config()
+    account = getattr(args, 'account', None)
+    config = load_config(account)
 
     all_episodes = []
     page = 0
@@ -782,7 +831,7 @@ def cmd_episodes(args):
             print(f"正在加载第 {page + 1} 页...")
             time.sleep(0.5)
 
-        data = api_request("POST", "/v1/episode/list", config, json=payload)
+        data = api_request("POST", "/v1/episode/list", config, json=payload, account=account)
 
         result = data.get("data", data)
         if isinstance(result, list):
@@ -832,8 +881,9 @@ def cmd_episodes(args):
 def cmd_episode(args):
     """Get single episode detail (includes subtitle data)."""
     episode_id = parse_input(args.id)
-    config = load_config()
-    data = api_request("GET", f"/v1/episode/get?eid={episode_id}", config)
+    account = getattr(args, 'account', None)
+    config = load_config(account)
+    data = api_request("GET", f"/v1/episode/get?eid={episode_id}", config, account=account)
 
     episode = data.get("data", data)
 
@@ -861,7 +911,7 @@ def cmd_episode(args):
         print("\n正在获取付费内容音频 URL...")
         try:
             priv_data = api_request(
-                "GET", f"/v1/private-media/get?eid={episode_id}", config
+                "GET", f"/v1/private-media/get?eid={episode_id}", config, account=account
             )
             priv_info = priv_data.get("data", priv_data)
             audio_url = priv_info.get("url", audio_url)
@@ -886,11 +936,12 @@ def cmd_episode(args):
 def cmd_download(args):
     """Download episode audio with resume support."""
     episode_id = parse_input(args.episode_id)
-    config = load_config()
+    account = getattr(args, 'account', None)
+    config = load_config(account)
 
     # Get episode info
     print("正在获取节目信息...")
-    data = api_request("GET", f"/v1/episode/get?eid={episode_id}", config)
+    data = api_request("GET", f"/v1/episode/get?eid={episode_id}", config, account=account)
     episode = data.get("data", data)
 
     title = episode.get("title", "Untitled")
@@ -903,7 +954,7 @@ def cmd_download(args):
         print("正在获取付费内容音频 URL...")
         try:
             priv_data = api_request(
-                "GET", f"/v1/private-media/get?eid={episode_id}", config
+                "GET", f"/v1/private-media/get?eid={episode_id}", config, account=account
             )
             priv_info = priv_data.get("data", priv_data)
             audio_url = priv_info.get("url", audio_url)
@@ -999,15 +1050,19 @@ def cmd_download(args):
     final_size = output_file.stat().st_size / 1024 / 1024
     print(f"文件大小: {final_size:.1f} MB")
 
+    # Validate downloaded file
+    if not _validate_audio(output_file):
+        print(f"警告: 下载文件可能损坏 (ffprobe 无法读取)，建议重新下载")
+
     # Download subtitles if requested
     if args.with_subtitles:
-        _download_subtitles(config, episode_id, output_dir, safe_title)
+        _download_subtitles(config, episode_id, output_dir, safe_title, account=account)
 
 
-def _download_subtitles(config, episode_id, output_dir, safe_title):
+def _download_subtitles(config, episode_id, output_dir, safe_title, account=None):
     """Helper: download and save subtitles."""
     print("正在获取字幕...")
-    data = api_request("GET", f"/v1/episode/get?eid={episode_id}", config)
+    data = api_request("GET", f"/v1/episode/get?eid={episode_id}", config, account=account)
     episode = data.get("data", data)
 
     subtitles = episode.get("subtitle", [])
@@ -1034,10 +1089,11 @@ def _download_subtitles(config, episode_id, output_dir, safe_title):
 def cmd_subtitles(args):
     """Get and convert episode subtitles."""
     episode_id = parse_input(args.episode_id)
-    config = load_config()
+    account = getattr(args, 'account', None)
+    config = load_config(account)
 
     print("正在获取字幕数据...")
-    data = api_request("GET", f"/v1/episode/get?eid={episode_id}", config)
+    data = api_request("GET", f"/v1/episode/get?eid={episode_id}", config, account=account)
     episode = data.get("data", data)
 
     subtitles = episode.get("subtitle", [])
@@ -1153,28 +1209,144 @@ def subtitle_to_text(subtitles):
 # Audio Transcription (faster-whisper)
 # ============================================================
 
+def _validate_audio(audio_path):
+    """Check if an audio file is valid using ffprobe.
+
+    Returns True if ffprobe can read the file's duration, False otherwise.
+    Catches cases like truncated downloads (missing moov atom).
+    """
+    import subprocess as sp
+    try:
+        r = sp.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1", str(audio_path)],
+            capture_output=True, text=True, timeout=30
+        )
+        return r.returncode == 0 and "duration" in r.stdout
+    except (sp.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def _download_audio(audio_url, audio_path):
+    """Download audio with validation and retry on corrupt or failed downloads."""
+    session = create_session()
+    tmp_path = audio_path.with_suffix(".tmp")
+    for attempt in range(1, 5):
+        try:
+            print(f"    下载音频{'(重试'+str(attempt-1)+')' if attempt > 1 else ''}...")
+            resp = session.get(audio_url, stream=True, verify=False, timeout=300)
+            resp.raise_for_status()
+            # Write to temp file first, then rename to avoid partial files
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    f.write(chunk)
+            # Only rename after full download
+            if tmp_path.exists():
+                tmp_path.replace(audio_path)
+            mb = audio_path.stat().st_size / 1024 / 1024
+            # Validate the downloaded file
+            if _validate_audio(audio_path):
+                print(f"    下载完成: {mb:.1f}MB (已验证)")
+                return True
+            else:
+                print(f"    下载文件损坏 ({mb:.1f}MB)，重试...")
+                audio_path.unlink(missing_ok=True)
+        except Exception as e:
+            # Clean up temp file on any error
+            tmp_path.unlink(missing_ok=True)
+            if attempt < 4:
+                wait = attempt * 5
+                print(f"    下载出错: {e}，{wait}s 后重试...")
+                time.sleep(wait)
+            else:
+                print(f"    下载失败: {e}")
+                return False
+    # All retries exhausted for corrupt files
+    print(f"    下载失败: 文件始终损坏")
+    return False
+
+
 def _convert_for_whisper(audio_path):
-    """Convert audio to 16kHz mono WAV for faster whisper processing."""
+    """Convert audio to 16kHz mono WAV for faster whisper processing.
+
+    Uses a file lock to prevent parallel ffmpeg processes from competing
+    for resources when multiple crawl processes run simultaneously.
+    Retries up to 3 times on failure.
+    """
     import subprocess as sp
     wav_path = audio_path.with_suffix(".wav")
     if wav_path.exists():
         return wav_path
-    print("    转换音频为 16kHz mono...")
-    sp.run([
-        "ffmpeg", "-y", "-i", str(audio_path),
-        "-ar", "16000", "-ac", "1", "-b:a", "32k",
-        str(wav_path)
-    ], capture_output=True, check=True)
-    wav_mb = wav_path.stat().st_size / 1024 / 1024
-    print(f"    转换后: {wav_mb:.1f}MB")
-    return wav_path
+
+    lock_path = audio_path.parent / ".ffmpeg.lock"
+    lock_fd = open(lock_path, "w")
+
+    def _acquire_lock(max_wait=30):
+        if sys.platform == "win32":
+            import msvcrt
+            deadline = time.time() + max_wait
+            while time.time() < deadline:
+                try:
+                    msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+                    return True
+                except OSError:
+                    time.sleep(0.5)
+            return False
+        else:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            return True
+
+    def _release_lock():
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+    for attempt in range(1, 4):
+        try:
+            _acquire_lock()
+        except OSError:
+            pass
+
+        try:
+            if wav_path.exists():
+                _release_lock()
+                lock_fd.close()
+                return wav_path
+            print("    转换音频为 16kHz mono...")
+            sp.run([
+                "ffmpeg", "-y", "-i", str(audio_path),
+                "-ar", "16000", "-ac", "1", "-b:a", "32k",
+                str(wav_path)
+            ], capture_output=True, check=True, timeout=300)
+            wav_mb = wav_path.stat().st_size / 1024 / 1024
+            print(f"    转换后: {wav_mb:.1f}MB")
+            _release_lock()
+            lock_fd.close()
+            return wav_path
+        except (sp.CalledProcessError, sp.TimeoutExpired) as e:
+            _release_lock()
+            if attempt < 3:
+                wait = attempt * 10
+                print(f"    ffmpeg 失败 (第{attempt}次)，{wait}s 后重试...")
+                time.sleep(wait)
+            else:
+                lock_fd.close()
+                raise
 
 
 def _cleanup_wav(audio_path):
-    """Remove temporary WAV file created for whisper."""
-    wav_path = audio_path.with_suffix(".wav")
-    if wav_path.exists():
-        wav_path.unlink()
+    """Remove temporary WAV and tmp files created during processing."""
+    for suffix in [".wav", ".tmp"]:
+        p = audio_path.with_suffix(suffix)
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 def transcribe_audio(audio_path, model_size="base", timeout=0):
@@ -1201,13 +1373,14 @@ def transcribe_audio(audio_path, model_size="base", timeout=0):
     if timeout and timeout > 0:
         # Subprocess approach: runs whisper in a separate process that can be truly killed
         import subprocess, json
+        wav_path_escaped = json.dumps(str(wav_path))
         script = (
             "import sys,json,os;"
             f"os.environ.setdefault('HF_ENDPOINT','https://hf-mirror.com');"
             f"os.environ.setdefault('KMP_DUPLICATE_LIB_OK','TRUE');"
             "from faster_whisper import WhisperModel;"
             f"model=WhisperModel('{model_size}',device='cpu',compute_type='int8');"
-            f"segs,info=model.transcribe(r'{wav_path}',language='zh',beam_size=3,"
+            f"segs,info=model.transcribe({wav_path_escaped},language='zh',beam_size=3,"
             "vad_filter=True,vad_parameters=dict(min_silence_duration_ms=500));"
             "print(''.join(s.text.strip() for s in segs))"
         )
@@ -1266,7 +1439,7 @@ def transcribe_audio(audio_path, model_size="base", timeout=0):
 # ============================================================
 
 def _process_single_episode(eid, seq, output_dir, audio_dir, config, whisper_model="base",
-                            no_transcribe=False, transcribe_timeout=0):
+                            transcribe_timeout=0, account=None):
     """Process a single episode: get details, subtitle or transcribe, save .md.
 
     Returns the saved file path on success, None on failure.
@@ -1287,7 +1460,7 @@ def _process_single_episode(eid, seq, output_dir, audio_dir, config, whisper_mod
     print(f"\n  [{seq}] {eid}")
 
     try:
-        detail = api_request("GET", f"/v1/episode/get?eid={eid}", config)
+        detail = api_request("GET", f"/v1/episode/get?eid={eid}", config, account=account)
     except APIError as e:
         print(f"    跳过: {e}")
         return None
@@ -1317,7 +1490,7 @@ def _process_single_episode(eid, seq, output_dir, audio_dir, config, whisper_mod
     # Check for private media
     if not audio_url and ep_data.get("isPrivateMedia"):
         try:
-            pm = api_request("GET", f"/v1/private-media/get?eid={eid}", config)
+            pm = api_request("GET", f"/v1/private-media/get?eid={eid}", config, account=account)
             pm_data = pm.get("data", pm)
             audio_url = pm_data.get("url", "")
         except APIError:
@@ -1330,9 +1503,9 @@ def _process_single_episode(eid, seq, output_dir, audio_dir, config, whisper_mod
 
     if subtitle_text:
         print(f"    {pub_date} {title}")
-        print(f"    内置字幕: {len(subtitle_text)} 字")
+        print(f"    字幕: {len(subtitle_text)} 字")
         md_file = _save_episode(output_dir, seq, pub_date, eid, title, desc,
-                                duration, shownotes, "内置字幕", subtitle_text, ep_meta)
+                                duration, shownotes, "字幕", subtitle_text, ep_meta)
         return md_file
 
     # No subtitles
@@ -1341,45 +1514,76 @@ def _process_single_episode(eid, seq, output_dir, audio_dir, config, whisper_mod
         return None
 
     # Save metadata-first placeholder (ensures .md exists even if transcription fails)
-    placeholder_text = "[\u5f85转录: 音频已下载但尚未转录，请稍后重试或使用 --no-transcribe 跳过]"
+    placeholder_text = "[\u5f85转录: 音频待下载，下载完成后将自动转录]"
     md_file = _save_episode(output_dir, seq, pub_date, eid, title, desc,
-                            duration, shownotes, "音频转录", placeholder_text, ep_meta)
+                            duration, shownotes, "转录", placeholder_text, ep_meta)
     print(f"    {pub_date} {title} — 先保存元信息")
 
-    if no_transcribe:
-        print(f"    已跳过转录 (--no-transcribe)")
-        return md_file
-
-    # Download audio
-    print(f"    下载音频...")
-    audio_file = audio_dir / f"{eid}.m4a"
+    # Download audio — check existing files regardless of extension
+    ext = get_audio_ext(audio_url)
+    audio_file = audio_dir / f"{eid}{ext}"
     if not audio_file.exists():
-        session = create_session()
-        resp = session.get(audio_url, stream=True, verify=False, timeout=300)
-        with open(audio_file, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                f.write(chunk)
-        mb = audio_file.stat().st_size / 1024 / 1024
-        print(f"    下载完成: {mb:.1f}MB")
+        # Also check other common extensions in case file was downloaded with wrong ext
+        for alt_ext in [".m4a", ".mp3", ".wav", ".ogg", ".flac", ".aac"]:
+            alt_file = audio_dir / f"{eid}{alt_ext}"
+            if alt_file.exists() and _validate_audio(alt_file):
+                audio_file = alt_file
+                break
+    if not audio_file.exists() or not _validate_audio(audio_file):
+        if audio_file.exists():
+            print(f"    音频文件损坏，重新下载...")
+            audio_file.unlink()
+        if not _download_audio(audio_url, audio_file):
+            print(f"    下载失败，跳过转录")
+            return md_file
     else:
         mb = audio_file.stat().st_size / 1024 / 1024
         print(f"    音频已存在 ({mb:.1f}MB)")
 
-    # Transcribe
-    transcript = transcribe_audio(audio_file, whisper_model, timeout=transcribe_timeout)
+    # Transcribe — wrap in try/except to prevent single failure from stopping batch
+    try:
+        transcript = transcribe_audio(audio_file, whisper_model, timeout=transcribe_timeout)
+    except Exception as e:
+        print(f"    转录异常: {e}，保留元信息文件")
+        transcript = ""
     if transcript:
         # Overwrite with actual transcript
         md_file = _save_episode(output_dir, seq, pub_date, eid, title, desc,
-                                duration, shownotes, "音频转录", transcript, ep_meta)
+                                duration, shownotes, "转录", transcript, ep_meta)
     else:
         print(f"    转录失败，保留元信息文件")
     return md_file
 
 
+def cmd_setup(args):
+    """Pre-download Whisper model for transcription."""
+    os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+    model_size = getattr(args, 'whisper_model', 'base')
+    print(f"正在下载 Whisper 模型 ({model_size})...")
+    print(f"  HF_ENDPOINT={os.environ.get('HF_ENDPOINT')}")
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print("错误: 需要安装 faster-whisper")
+        print("  运行: pip install faster-whisper")
+        sys.exit(1)
+
+    try:
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        print(f"Whisper 模型 ({model_size}) 已就绪!")
+    except Exception as e:
+        print(f"模型下载失败: {e}")
+        sys.exit(1)
+
+
 def cmd_crawl(args):
     """Batch-crawl a podcast: subtitle-first, audio-transcription fallback."""
     podcast_id = parse_input(args.podcast_id)
-    config = load_config()
+    account = getattr(args, 'account', None)
+    config = load_config(account)
 
     max_episodes = args.max_episodes
     whisper_model = args.whisper_model
@@ -1387,7 +1591,7 @@ def cmd_crawl(args):
     # Get podcast info first (for folder name)
     print("获取播客信息...")
     try:
-        pod_data = api_request("GET", f"/v1/podcast/get?pid={podcast_id}", config)
+        pod_data = api_request("GET", f"/v1/podcast/get?pid={podcast_id}", config, account=account)
     except APIError as e:
         print(f"错误: 无法获取播客信息: {e}")
         return
@@ -1403,6 +1607,17 @@ def cmd_crawl(args):
     audio_dir.mkdir(parents=True, exist_ok=True)
     state_file = output_dir / "crawl_state.json"
 
+    # Save podcast metadata for hub adapter
+    podcast_meta = {
+        "pid": podcast_id,
+        "title": pod_info.get("title", ""),
+        "author": pod_info.get("author", ""),
+        "description": pod_info.get("description", ""),
+        "episode_count": pod_info.get("episodeCount", 0),
+    }
+    with open(output_dir / "podcast_info.json", "w", encoding="utf-8") as f:
+        json.dump(podcast_meta, f, ensure_ascii=False, indent=2)
+
     print(f"播客: {podcast_title}")
     print(f"输出目录: {output_dir}")
 
@@ -1412,7 +1627,7 @@ def cmd_crawl(args):
         with open(state_file, "r", encoding="utf-8") as f:
             state = json.load(f)
 
-    if state["count"] >= max_episodes and not args.reset:
+    if len(state["crawled"]) >= max_episodes and not args.reset:
         print(f"已完成 {state['count']} 次爬取，任务结束！（使用 --reset 重新开始）")
         return
 
@@ -1422,7 +1637,7 @@ def cmd_crawl(args):
     payload = {"pid": podcast_id, "limit": 20, "order": "desc"}
     while True:
         try:
-            data = api_request("POST", "/v1/episode/list", config, json=payload)
+            data = api_request("POST", "/v1/episode/list", config, json=payload, account=account)
         except APIError as e:
             print(f"  获取列表失败: {e}")
             break
@@ -1431,6 +1646,9 @@ def cmd_crawl(args):
             all_episodes.extend(batch)
         elif isinstance(batch, dict):
             all_episodes.extend(batch.get("episodes", []))
+        # Stop early if we already have enough episodes
+        if len(all_episodes) >= max_episodes:
+            break
         load_more = data.get("loadMoreKey")
         if not load_more:
             break
@@ -1461,7 +1679,7 @@ def cmd_crawl(args):
     crawled_eids = set(state["crawled"])
     metadata_only_eids = set(state.get("metadata_only", []))
     # Episodes that were metadata-only can be re-processed for transcription
-    remaining = max_episodes - state["count"]
+    remaining = max_episodes - len(crawled_eids)
     uncrawled = []
     for ep in latest_episodes:
         eid = ep.get("eid", ep.get("id", ""))
@@ -1483,7 +1701,7 @@ def cmd_crawl(args):
 
     for eid in uncrawled:
         try:
-            detail = api_request("GET", f"/v1/episode/get?eid={eid}", config)
+            detail = api_request("GET", f"/v1/episode/get?eid={eid}", config, account=account)
         except APIError as e:
             print(f"  跳过 {eid}: {e}")
             continue
@@ -1502,18 +1720,20 @@ def cmd_crawl(args):
         podcast_info = ep_data.get("podcast", {})
         podcasters_raw = podcast_info.get("podcasters", [])
         ep_meta = {
+            "pid": podcast_id,
             "pub_date": pub_date,
             "podcast_title": podcast_info.get("title", podcast_title),
             "podcasters": [
                 {"nickname": p.get("nickname", ""), "bio": p.get("bio", "")}
                 for p in podcasters_raw if p.get("nickname")
             ],
+            "enclosure": enclosure,
         }
 
         # Check for private media
         if not audio_url and ep_data.get("isPrivateMedia"):
             try:
-                pm = api_request("GET", f"/v1/private-media/get?eid={eid}", config)
+                pm = api_request("GET", f"/v1/private-media/get?eid={eid}", config, account=account)
                 pm_data = pm.get("data", pm)
                 audio_url = pm_data.get("url", "")
             except APIError:
@@ -1527,11 +1747,11 @@ def cmd_crawl(args):
 
         if subtitle_text:
             print(f"  [{seq}] {pub_date} {title}")
-            print(f"    内置字幕: {len(subtitle_text)} 字")
-            _save_episode(output_dir, seq, pub_date, eid, title, desc, duration, shownotes, "内置字幕", subtitle_text, ep_meta)
+            print(f"    字幕: {len(subtitle_text)} 字")
+            _save_episode(output_dir, seq, pub_date, eid, title, desc, duration, shownotes, "字幕", subtitle_text, ep_meta)
             state["crawled"].append(eid)
             state["count"] += 1
-            _save_state(state_file, state)
+            _save_state(state_file, state, pid=podcast_id)
         else:
             has_audio = bool(audio_url)
             label = "有音频，需转录" if has_audio else "无音频无字幕"
@@ -1547,76 +1767,84 @@ def cmd_crawl(args):
         time.sleep(0.3)
 
     # ── Pass 2: Audio transcription ──
-    if needs_transcription and not getattr(args, 'no_transcribe', False):
+    if needs_transcription:
         print("\n" + "=" * 60)
-        print(f"【第2轮】音频转录 — {len(needs_transcription)} 集需要转录")
+        print(f"【第2轮】转录 — {len(needs_transcription)} 集需要转录")
         print("=" * 60)
 
         for ep in needs_transcription:
-            if state["count"] >= max_episodes:
+            if len(state["crawled"]) >= max_episodes:
                 break
 
-            eid = ep["eid"]
-            title = ep["title"]
-            seq = ep["seq"]
-            pub_date = ep["pub_date"]
-            print(f"\n  [{seq}] {pub_date} {title}")
+            try:
+                eid = ep["eid"]
+                title = ep["title"]
+                seq = ep["seq"]
+                pub_date = ep["pub_date"]
+                print(f"\n  [{seq}] {pub_date} {title}")
 
-            audio_file = audio_dir / f"{eid}.m4a"
+                ext = get_audio_ext(ep["audio_url"])
+                audio_file = audio_dir / f"{eid}{ext}"
+                if not audio_file.exists():
+                    for alt_ext in [".m4a", ".mp3", ".wav", ".ogg", ".flac", ".aac"]:
+                        alt_file = audio_dir / f"{eid}{alt_ext}"
+                        if alt_file.exists() and _validate_audio(alt_file):
+                            audio_file = alt_file
+                            break
 
-            if not audio_file.exists():
-                print(f"    下载音频...")
-                session = create_session()
-                resp = session.get(ep["audio_url"], stream=True, verify=False, timeout=300)
-                with open(audio_file, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=65536):
-                        f.write(chunk)
-                mb = audio_file.stat().st_size / 1024 / 1024
-                print(f"    下载完成: {mb:.1f}MB")
-            else:
-                mb = audio_file.stat().st_size / 1024 / 1024
-                print(f"    音频已存在 ({mb:.1f}MB)，跳过下载")
+                if not audio_file.exists() or not _validate_audio(audio_file):
+                    if audio_file.exists():
+                        print(f"    音频文件损坏，重新下载...")
+                        audio_file.unlink()
+                    if not _download_audio(ep["audio_url"], audio_file):
+                        print(f"    下载失败，跳过此集")
+                        continue
+                else:
+                    mb = audio_file.stat().st_size / 1024 / 1024
+                    print(f"    音频已存在 ({mb:.1f}MB)")
 
-            transcript = transcribe_audio(audio_file, whisper_model,
-                                          timeout=getattr(args, 'transcribe_timeout', 0))
+                try:
+                    transcript = transcribe_audio(audio_file, whisper_model,
+                                                  timeout=getattr(args, 'transcribe_timeout', 0))
+                except Exception as e:
+                    print(f"    转录异常: {e}")
+                    _cleanup_wav(audio_file)
+                    transcript = ""
 
-            if transcript:
-                _save_episode(output_dir, seq, pub_date, eid, title, ep["description"],
-                              ep["duration"], ep["shownotes"], "音频转录", transcript,
-                              ep.get("ep_meta"))
-                state["crawled"].append(eid)
-                state["count"] += 1
-                _save_state(state_file, state)
-            else:
-                # Save metadata placeholder so progress isn't lost, but don't mark as fully crawled
-                placeholder = "[待转录: 音频已下载但转录失败，请稍后重试或使用 --reset]"
-                _save_episode(output_dir, seq, pub_date, eid, title, ep["description"],
-                              ep["duration"], ep["shownotes"], "音频转录", placeholder,
-                              ep.get("ep_meta"))
-                # Don't add to state["crawled"] — will be retried on next run
-                print(f"    转录失败，已保存元信息（下次运行将重试）")
+                if transcript:
+                    _save_episode(output_dir, seq, pub_date, eid, title, ep["description"],
+                                  ep["duration"], ep["shownotes"], "转录", transcript,
+                                  ep.get("ep_meta"))
+                    state["crawled"].append(eid)
+                    state["count"] += 1
+                    _save_state(state_file, state, pid=podcast_id)
+                else:
+                    placeholder = "[待转录: 音频已下载但转录失败，请稍后重试或使用 --reset]"
+                    _save_episode(output_dir, seq, pub_date, eid, title, ep["description"],
+                                  ep["duration"], ep["shownotes"], "转录", placeholder,
+                                  ep.get("ep_meta"))
+                    print(f"    转录失败，已保存元信息（下次运行将重试）")
 
-    # ── Pass 2b: Save metadata-only for skipped transcription ──
-    elif needs_transcription and getattr(args, 'no_transcribe', False):
-        print(f"\n跳过转录 (--no-transcribe)，保存 {len(needs_transcription)} 集元信息")
-        for ep in needs_transcription:
-            eid = ep["eid"]
-            placeholder = "[待转录: 使用 --no-transcribe 跳过转录。去掉 --no-transcribe 重新运行以获取转录文本]"
-            _save_episode(output_dir, ep["seq"], ep["pub_date"], eid, ep["title"],
-                          ep["description"], ep["duration"], ep["shownotes"],
-                          "音频转录", placeholder, ep.get("ep_meta"))
-            # Track separately so they can be re-run for transcription later
-            if "metadata_only" not in state:
-                state["metadata_only"] = []
-            state["metadata_only"].append(eid)
-            state["count"] += 1
-            _save_state(state_file, state)
+            except APIError as e:
+                print(f"    API 错误，跳过此集: {e}")
+                continue
+            except Exception as e:
+                print(f"    未知错误，跳过此集: {e}")
+                # Clean up any leftover temp files
+                try:
+                    _cleanup_wav(audio_dir / f"{eid}.m4a")
+                    _cleanup_wav(audio_dir / f"{eid}.mp3")
+                except Exception:
+                    pass
+                continue
 
     # ── Summary ──
+    total_episodes = state["count"]
     print("\n" + "=" * 60)
-    print(f"爬取完成! {podcast_title} — 共 {state['count']} 集")
+    print(f"爬取完成! {podcast_title} — 共 {total_episodes} 集")
     print(f"输出目录: {output_dir}")
     print("=" * 60)
+    print(f'__CRAWL_METRICS__:{{"items_found":{total_episodes},"items_new":{total_episodes},"items_failed":0}}')
 
     # ── CSV Export ──
     if getattr(args, 'csv', False):
@@ -1627,7 +1855,8 @@ def cmd_crawl(args):
 def cmd_crawl_one(args):
     """Process a single episode: get details, subtitle or transcribe, save .md."""
     eid = parse_input(args.episode_id)
-    config = load_config()
+    account = getattr(args, 'account', None)
+    config = load_config(account)
     seq = args.seq
 
     # Output dir
@@ -1640,8 +1869,8 @@ def cmd_crawl_one(args):
     md_file = _process_single_episode(
         eid, seq, output_dir, audio_dir, config,
         args.whisper_model,
-        no_transcribe=getattr(args, "no_transcribe", False),
         transcribe_timeout=getattr(args, "transcribe_timeout", 0),
+        account=account,
     )
     if md_file:
         print(f"\n完成! 输出: {md_file}")
@@ -1720,7 +1949,7 @@ def _save_episode(output_dir, seq, pub_date, eid, title, desc, duration, shownot
         # --- 正文 ---
         f.write(f"\n## 正文\n\n")
         if text:
-            if source == "音频转录":
+            if source == "转录":
                 f.write("> [!note]\n")
                 f.write("> 以下为语音识别原始文本，**无标点断句**，可能存在识别错误（人名、术语等）。\n")
                 f.write("> 请在此基础上进行后处理：添加标点、修正错误、按话题分段。\n\n")
@@ -1730,6 +1959,7 @@ def _save_episode(output_dir, seq, pub_date, eid, title, desc, duration, shownot
 
     chars = len(text) if text else 0
     print(f"    已保存: {md_file} ({chars} 字)")
+
     return md_file
 
 
@@ -1817,12 +2047,12 @@ def _parse_md_to_csv(md_path):
 def _save_csv_row(csv_path, episode_data, write_header=False):
     """Append one episode as a CSV row. Write BOM + header if write_header=True."""
     import csv
-    needs_header = write_header or not Path(csv_path).exists()
-    is_new = not Path(csv_path).exists()
+    csv_path = Path(csv_path)
+    is_new = not csv_path.exists()
 
     with open(csv_path, "a", encoding="utf-8-sig", newline='') as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction='ignore')
-        if is_new:
+        if is_new or write_header:
             writer.writeheader()
         writer.writerow(episode_data)
 
@@ -1863,10 +2093,135 @@ def cmd_export(args):
     _export_csv(output_dir)
 
 
-def _save_state(state_file, state):
-    """Save crawl state to JSON."""
-    with open(state_file, "w", encoding="utf-8") as f:
+def _save_state(state_file, state, pid=None):
+    """Save crawl state to JSON with atomic write, and mirror to Postgres."""
+    tmp = state_file.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
+    tmp.replace(state_file)
+
+
+def cmd_list_accounts(args):
+    """List all logged-in accounts."""
+    print("已登录账户:\n")
+    if CREDENTIALS_FILE.exists():
+        try:
+            config = json.loads(CREDENTIALS_FILE.read_text(encoding="utf-8"))
+            mode = config.get("mode", "N/A")
+            last = config.get("last_refresh", config.get("login_time", "N/A"))
+            print(f"  [default]  模式: {mode}  上次刷新: {last}")
+        except (json.JSONDecodeError, OSError):
+            print(f"  [default]  (读取失败)")
+    if PROFILES_DIR.exists():
+        for f in sorted(PROFILES_DIR.glob("*.json")):
+            name = f.stem
+            try:
+                config = json.loads(f.read_text(encoding="utf-8"))
+                mode = config.get("mode", "N/A")
+                last = config.get("last_refresh", config.get("login_time", "N/A"))
+                print(f"  {name}  模式: {mode}  上次刷新: {last}")
+            except (json.JSONDecodeError, OSError):
+                print(f"  {name}  (读取失败)")
+    if not CREDENTIALS_FILE.exists() and not (PROFILES_DIR.exists() and list(PROFILES_DIR.glob("*.json"))):
+        print("  (无)")
+        print("\n提示: 运行 python xyz.py login --adb 登录")
+
+
+def cmd_serve(args):
+    """守护进程模式：自动循环爬取。每轮：刷新token → 爬取 → 休息。"""
+    import signal
+    import time as _time
+
+    interval_s = args.interval * 3600
+    max_eps = args.max_episodes
+
+    stop = [False]
+    def _stop(sig, frame):
+        print("\n[serve] 收到停止信号，等当前任务完成...")
+        stop[0] = True
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    print(f"[serve] 启动，间隔 {args.interval}h，每轮最多 {max_eps} 集")
+
+    while not stop[0]:
+        print(f"\n{'='*50}")
+        print(f"[serve] 新一轮开始 {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # 1. 刷新 token
+        config = load_config(getattr(args, 'account', None))
+        if not config:
+            print("[serve] 无凭据，退出。请先运行: python xyz.py login --adb")
+            break
+        try:
+            refresh_access_token(config)
+            print("[serve] Token 已刷新")
+        except APIError as e:
+            print(f"[serve] Token 刷新失败: {e}")
+            print("[serve] 需要人工重新登录: python xyz.py login --adb")
+            _write_serve_alert("xiaoyuzhou", f"Token 刷新失败: {e}", "python xyz.py login --adb")
+            print(f"[serve] 等待 {args.interval}h 后重试...")
+            _sleep_or_stop(stop, interval_s)
+            continue
+
+        # 2. 获取要爬的 PID 列表
+        pids = args.pids
+        if not pids:
+            print("[serve] 无可爬目标（请通过 --pids 指定，或使用 hub_adapter.py 从 Hub 读取）")
+            _sleep_or_stop(stop, interval_s)
+            continue
+
+        # 3. 逐个爬取
+        for pid in pids:
+            if stop[0]:
+                break
+            print(f"\n[serve] 爬取 {pid} (max={max_eps})")
+            crawl_args = argparse.Namespace(
+                podcast_id=pid, max_episodes=max_eps,
+                output=str(DEFAULT_OUTPUT_DIR / "crawl"),
+                whisper_model="base",
+                transcribe_timeout=0, reset=False, csv=False,
+                account=getattr(args, 'account', None),
+            )
+            try:
+                cmd_crawl(crawl_args)
+            except Exception as e:
+                print(f"[serve] 爬取失败: {e}")
+                _write_serve_alert("xiaoyuzhou", f"爬取 {pid} 失败: {e}")
+
+        # 4. 休息
+        print(f"\n[serve] 本轮结束，{args.interval}h 后开始下一轮")
+        _sleep_or_stop(stop, interval_s)
+
+    print("[serve] 已停止")
+
+
+def _write_serve_alert(source_type: str, message: str, action: str = ""):
+    """写入告警到 JSONL 文件。"""
+    try:
+        alert_path = Path(__file__).resolve().parent.parent / "crawler_alerts.jsonl"
+        record = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "source_type": source_type,
+            "severity": "expired",
+            "message": message[:300],
+            "action_required": action,
+        }
+        with open(str(alert_path), "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _sleep_or_stop(stop, seconds):
+    """可中断的 sleep。每10秒检查一次停止信号。"""
+    for _ in range(int(seconds) // 10):
+        if stop[0]:
+            return
+        time.sleep(10)
+    remaining = seconds % 10
+    if remaining > 0 and not stop[0]:
+        time.sleep(remaining)
 
 
 def _strip_html(html_str):
@@ -1905,6 +2260,12 @@ def main():
   python xyz.py subtitles <episode_id> -f srt    # 获取字幕
   python xyz.py crawl <podcast_id> -n 10          # 批量爬取播客（含转录）
 
+多账号示例:
+  python xyz.py login --adb --device 127.0.0.1:7555 --account phone1  # MuMu实例1
+  python xyz.py login --adb --device 127.0.0.1:7556 --account phone2  # MuMu实例2
+  python xyz.py list-accounts                                           # 列出所有账号
+  python xyz.py crawl-one <eid> --seq 1 --account phone1 -o ./output   # 指定账号爬取
+
 播客/单集 ID 可以是纯 ID，也可以是完整 URL:
   python xyz.py podcast https://www.xiaoyuzhoufm.com/podcast/xxxxx
 
@@ -1927,11 +2288,13 @@ def main():
     p_login.add_argument("--area-code", "-a", default="+86", help="区号 (默认 +86)")
     p_login.add_argument("--mode", "-m", choices=["ios", "android"], default="ios",
                          help="请求头模式 (默认 ios，推荐)")
+    p_login.add_argument("--account", "-A", help="保存到指定账户名 (多账号模式)")
 
     # ---- token ----
     p_token = sub.add_parser("token", help="检查/刷新/验证 token")
     p_token.add_argument("--refresh", "-r", action="store_true", help="刷新 token")
     p_token.add_argument("--verify", "-v", action="store_true", help="验证 token 是否有效")
+    p_token.add_argument("--account", "-A", help="账户名")
 
     # ---- search ----
     p_search = sub.add_parser("search", help="搜索播客 (iTunes + 小宇宙 API)")
@@ -1939,12 +2302,14 @@ def main():
     p_search.add_argument("--limit", "-n", type=int, default=10, help="结果数量 (默认 10)")
     p_search.add_argument("--xiaoyuzhou", "-x", action="store_true",
                           help="强制使用小宇宙搜索 (跳过 iTunes，可搜独占播客)")
+    p_search.add_argument("--account", "-A", help="账户名")
 
     # ---- podcast ----
     p_podcast = sub.add_parser("podcast", help="获取播客详情")
     p_podcast.add_argument("id", help="播客 ID 或 URL")
     p_podcast.add_argument("--save-json", metavar="FILE", help="保存为 JSON 文件")
     p_podcast.add_argument("--raw", action="store_true", help="输出完整 JSON")
+    p_podcast.add_argument("--account", "-A", help="账户名")
 
     # ---- episodes ----
     p_episodes = sub.add_parser("episodes", help="获取播客节目列表")
@@ -1952,6 +2317,7 @@ def main():
     p_episodes.add_argument("--limit", "-n", type=int, default=20, help="每页数量 (默认 20)")
     p_episodes.add_argument("--max-pages", type=int, default=1, help="最大页数 (默认 1)")
     p_episodes.add_argument("--save-json", metavar="FILE", help="保存为 JSON 文件")
+    p_episodes.add_argument("--account", "-A", help="账户名")
 
     # ---- episode ----
     p_episode = sub.add_parser("episode", help="获取单集详情（含字幕数据）")
@@ -1959,6 +2325,7 @@ def main():
     p_episode.add_argument("--save-json", metavar="FILE", help="保存为 JSON 文件")
     p_episode.add_argument("--raw", action="store_true", help="输出完整 JSON")
     p_episode.add_argument("--skip-media", action="store_true", help="跳过付费内容音频 URL 获取")
+    p_episode.add_argument("--account", "-A", help="账户名")
 
     # ---- download ----
     p_download = sub.add_parser("download", help="下载音频文件")
@@ -1967,6 +2334,7 @@ def main():
     p_download.add_argument("--no-resume", dest="resume", action="store_false", help="不使用断点续传")
     p_download.add_argument("--force", "-f", action="store_true", help="强制重新下载")
     p_download.add_argument("--with-subtitles", "-s", action="store_true", help="同时下载字幕")
+    p_download.add_argument("--account", "-A", help="账户名")
 
     # ---- subtitles ----
     p_sub = sub.add_parser("subtitles", help="获取并转换字幕")
@@ -1979,9 +2347,10 @@ def main():
         default="all",
         help="字幕格式 (默认 all)",
     )
+    p_sub.add_argument("--account", "-A", help="账户名")
 
     # ---- crawl ----
-    p_crawl = sub.add_parser("crawl", help="批量爬取播客（字幕优先，音频转录兜底）")
+    p_crawl = sub.add_parser("crawl", help="批量爬取播客（字幕优先，转录兜底）")
     p_crawl.add_argument("podcast_id", help="播客 ID 或 URL")
     p_crawl.add_argument("-n", "--max-episodes", type=int, default=10, help="爬取集数 (默认 10)")
     p_crawl.add_argument("-o", "--output", default=str(DEFAULT_OUTPUT_DIR / "crawl"),
@@ -1989,13 +2358,12 @@ def main():
     p_crawl.add_argument("--whisper-model", default="base",
                          choices=["tiny", "base", "small", "medium", "large-v3"],
                          help="Whisper 模型 (默认 base，需安装 faster-whisper)")
-    p_crawl.add_argument("--no-transcribe", action="store_true",
-                         help="无字幕时不转录，只保存元信息")
     p_crawl.add_argument("--transcribe-timeout", type=int, default=0,
                          help="单集转录超时秒数 (0=无限制)")
     p_crawl.add_argument("--reset", action="store_true", help="重置状态，从头开始")
     p_crawl.add_argument("--csv", action="store_true",
                          help="爬取结束后自动导出 CSV（飞书导入格式）")
+    p_crawl.add_argument("--account", "-A", help="账户名")
 
     # ---- crawl-one ----
     p_crawl_one = sub.add_parser("crawl-one", help="处理单集（供逐集爬取使用）")
@@ -2006,16 +2374,30 @@ def main():
     p_crawl_one.add_argument("--whisper-model", default="base",
                              choices=["tiny", "base", "small", "medium", "large-v3"],
                              help="Whisper 模型 (默认 base)")
-    p_crawl_one.add_argument("--no-transcribe", action="store_true",
-                             help="无字幕时不转录，只保存元信息")
     p_crawl_one.add_argument("--transcribe-timeout", type=int, default=0,
                              help="转录超时秒数 (0=无限制)")
     p_crawl_one.add_argument("--csv", action="store_true",
                              help="同时输出 CSV 行（飞书导入格式，追加到同目录 CSV 文件）")
+    p_crawl_one.add_argument("--account", "-A", help="账户名")
 
     # ---- export ----
     p_export = sub.add_parser("export", help="将已有 .md 文件导出为 CSV（飞书导入格式）")
     p_export.add_argument("directory", help="包含 .md 文件的目录")
+
+    # ---- list-accounts ----
+    sub.add_parser("list-accounts", help="列出所有已登录账户")
+
+    # ---- setup ----
+    p_setup = sub.add_parser("setup", help="预下载 Whisper 模型（安装时使用）")
+    p_setup.add_argument("--whisper-model", default="base",
+                         choices=["tiny", "base", "small", "medium", "large-v3"],
+                         help="Whisper 模型 (默认 base)")
+
+    # ---- serve ----
+    p_serve = sub.add_parser("serve", help="守护进程模式：自动循环爬取")
+    p_serve.add_argument("--interval", type=int, default=6, help="爬取间隔（小时，默认6）")
+    p_serve.add_argument("--max-episodes", type=int, default=10, help="每次最多爬取集数（默认10）")
+    p_serve.add_argument("--pids", nargs="*", help="指定播客 PID 列表（不指定则从数据库读取）")
 
     args = parser.parse_args()
 
@@ -2032,9 +2414,12 @@ def main():
         "episode": cmd_episode,
         "download": cmd_download,
         "subtitles": cmd_subtitles,
+        "setup": cmd_setup,
         "crawl": cmd_crawl,
         "crawl-one": cmd_crawl_one,
         "export": cmd_export,
+        "list-accounts": cmd_list_accounts,
+        "serve": cmd_serve,
     }
 
     cmd_func = commands.get(args.command)

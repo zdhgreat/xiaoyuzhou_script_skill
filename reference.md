@@ -146,7 +146,9 @@ GET /v1/private-media/get?eid=<episode_id>
 
 ## 配置文件
 
-路径: `~/.xiaoyuzhou/credentials.json`
+默认账户路径: `~/.xiaoyuzhou/credentials.json`
+
+命名账户路径: `~/.xiaoyuzhou/profiles/<账户名>.json`
 
 ```json
 {
@@ -158,3 +160,5 @@ GET /v1/private-media/get?eid=<episode_id>
   "last_refresh": "2026-05-12 13:55:24"
 }
 ```
+
+使用 `--account NAME` / `-A NAME` 参数指定命名账户，不指定时使用默认账户。

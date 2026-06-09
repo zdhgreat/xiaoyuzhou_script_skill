@@ -19,8 +19,11 @@ credentials.json
 .DS_Store
 Thumbs.db
 
+# Environment variables (contains credentials)
+.env
+
 # Temporary audio conversion files
 *.wav
 
-# Claude Code
+# Agent platform local config
 .claude/
